@@ -1,0 +1,7 @@
+[
+   {
+      "directory" : "C:/Users/jeveux/workspace_ccstheia/my_ti_control/Debug",
+      "command"   : "clang++ -I\"C:/Users/jeveux/workspace_ccstheia/my_ti_control\" -I\"C:/Users/jeveux/workspace_ccstheia/my_ti_control/Debug\" -I\"D:/CCS/mspm0_sdk_2_11_00_07/source/third_party/CMSIS/Core/Include\" -I\"D:/CCS/mspm0_sdk_2_11_00_07/source\" -isystem\"D:/CCS/ccs/tools/compiler/ti-cgt-armllvm_5.1.1.LTS/include/armv7em-ti-none-eabihf/c++/v1\" -isystem\"D:/CCS/ccs/tools/compiler/ti-cgt-armllvm_5.1.1.LTS/include/c++/v1\" -isystem\"D:/CCS/ccs/tools/compiler/ti-cgt-armllvm_5.1.1.LTS/lib/clang/22/include\" -isystem\"D:/CCS/ccs/tools/compiler/ti-cgt-armllvm_5.1.1.LTS/include/c\" -xc",
+      "file"      : "C:/Users/jeveux/workspace_ccstheia/my_ti_control/empty.c"
+   }
+]
