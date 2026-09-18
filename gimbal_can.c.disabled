@@ -1,0 +1,207 @@
+/* gimbal.c —— 见 gimbal.h */
+
+#include "ti_msp_dl_config.h"
+#include "gimbal.h"
+
+/* 发送用哪一号 TX 缓冲。syscfg 里 txBufNum = 2, 这里固定用 0 号,
+ * 发之前先查它有没有挂着未完成的请求。 */
+#define GIMBAL_TX_BUF       0u
+
+/* 一帧最多 8 字节数据 */
+#define GIMBAL_TX_DLC       3u      /* 控制报文固定 3 字节 */
+
+/* 角度步进的量程: ±2π rad (手册 5.3.2.1 角度步进控制) */
+#define GIMBAL_MAX_STEP_RAD 6.28318530718f
+
+static volatile gimbal_feedback_t s_fb;
+static volatile bool              s_fb_ready;
+
+volatile uint32_t g_gimbal_rx_count = 0u;
+volatile uint32_t g_gimbal_tx_fail  = 0u;
+volatile uint32_t g_gimbal_bus_off  = 0u;
+
+/* ==========================================================================
+ * 发送
+ * ========================================================================== */
+
+bool gimbal_send_cmd(uint8_t cmd, int16_t value)
+{
+    DL_MCAN_TxBufElement tx;
+    uint8_t              i;
+
+    /* 0 号缓冲还挂着未完成的发送请求 -> 本次放弃, 不排队。
+     * 控制环要的是"现在该转到哪", 补发一条过期的指令没有意义。 */
+    if ((DL_MCAN_getTxBufReqPend(MCAN0_INST) & (1u << GIMBAL_TX_BUF)) != 0u) {
+        g_gimbal_tx_fail++;
+        return false;
+    }
+
+    tx.id  = ((uint32_t) GIMBAL_TX_ID) << 18U;  /* 标准 ID 存于 id[28:18] */
+    tx.rtr = 0U;                                /* 数据帧 */
+    tx.xtd = 0U;                                /* 11 位标准帧 */
+    tx.esi = 0U;
+    tx.dlc = GIMBAL_TX_DLC;
+    tx.brs = 0U;                                /* 经典 CAN, 不做速率切换 */
+    tx.fdf = 0U;                                /* 经典 CAN 帧 */
+    /* efc=0: 不往 TX Event FIFO 写记录。
+     * 例程里是 1, 但那是为了演示 TX Event 功能。我们从不读那个 FIFO,
+     * 置 1 只会让它写满 2 个条目后开始覆盖并置 "Element Lost" —— 纯浪费。 */
+    tx.efc = 0U;
+    tx.mm  = 0U;                                /* 仅 efc=1 时有意义 */
+
+    for (i = 0u; i < 8u; i++) {
+        tx.data[i] = 0u;
+    }
+    tx.data[0] = cmd;
+    tx.data[1] = (uint8_t) ((uint16_t) value & 0xFFu);          /* 小端低字节 */
+    tx.data[2] = (uint8_t) (((uint16_t) value >> 8) & 0xFFu);   /* 小端高字节 */
+
+    DL_MCAN_writeMsgRam(MCAN0_INST, DL_MCAN_MEM_TYPE_BUF, GIMBAL_TX_BUF, &tx);
+    DL_MCAN_TXBufAddReq(MCAN0_INST, GIMBAL_TX_BUF);
+
+    return true;
+}
+
+bool gimbal_step_rad(float dtheta)
+{
+    if (dtheta > GIMBAL_MAX_STEP_RAD) {
+        dtheta = GIMBAL_MAX_STEP_RAD;
+    } else if (dtheta < -GIMBAL_MAX_STEP_RAD) {
+        dtheta = -GIMBAL_MAX_STEP_RAD;
+    }
+
+    /* raw = θ / (2π) × 32767, 与手册 0x05 的换算同构 */
+    return gimbal_send_cmd(GIMBAL_CMD_ANGLE_STEP,
+                           (int16_t) (dtheta / GIMBAL_MAX_STEP_RAD *
+                                      GIMBAL_RAW_PER_TURN));
+}
+
+bool gimbal_enable(void)
+{
+    return gimbal_send_cmd(GIMBAL_CMD_ENABLE, 0);
+}
+
+bool gimbal_disable(void)
+{
+    return gimbal_send_cmd(GIMBAL_CMD_DISABLE, 0);
+}
+
+bool gimbal_set_zero(void)
+{
+    return gimbal_send_cmd(GIMBAL_CMD_SET_ZERO, 0);
+}
+
+bool gimbal_clear_error(void)
+{
+    return gimbal_send_cmd(GIMBAL_CMD_CLEAR_ERROR, 0);
+}
+
+/* ==========================================================================
+ * 接收
+ * ========================================================================== */
+
+/* 把 RX FIFO 0 里的报文全部取空并解析。
+ *
+ * 必须取空 —— FIFO 只有 8 级, 只取一条的话剩下的一直占着, 满了之后
+ * 新报文会被丢弃 (RX FIFO0 配置成 blocking 模式)。
+ */
+static void gimbal_rx_drain(void)
+{
+    DL_MCAN_RxFIFOStatus   fs;
+    DL_MCAN_RxBufElement   rx;
+
+    fs.num = DL_MCAN_RX_FIFO_NUM_0;
+
+    for (;;) {
+        fs.fillLvl = 0u;
+        DL_MCAN_getRxFIFOStatus(MCAN0_INST, &fs);
+        if (fs.fillLvl == 0u) {
+            break;
+        }
+
+        /* FIFO 类型时 bufNum 参数被忽略, 传 0 即可 */
+        DL_MCAN_readMsgRam(MCAN0_INST, DL_MCAN_MEM_TYPE_FIFO, 0u, fs.num, &rx);
+        DL_MCAN_writeRxFIFOAck(MCAN0_INST, fs.num, fs.getIdx);
+
+        /* 总线上只应有这一台电机, 但仍按 ID 过滤一次, 防止别的东西混进来 */
+        if (((rx.id & 0x1FFC0000u) >> 18u) == GIMBAL_RX_ID) {
+            s_fb.mode    = (uint8_t) ((rx.data[0] >> 4) & 0x0Fu);
+            s_fb.enabled = (rx.data[0] & 0x01u) != 0u;
+            s_fb.error   = rx.data[1];
+
+            s_fb.current_raw = (int16_t) ((uint16_t) rx.data[2] |
+                                          ((uint16_t) rx.data[3] << 8));
+            s_fb.speed_raw   = (int16_t) ((uint16_t) rx.data[4] |
+                                          ((uint16_t) rx.data[5] << 8));
+            s_fb.angle_raw   = (uint16_t) ((uint16_t) rx.data[6] |
+                                           ((uint16_t) rx.data[7] << 8));
+
+            s_fb_ready = true;
+            g_gimbal_rx_count++;
+        }
+    }
+}
+
+bool gimbal_get_feedback(gimbal_feedback_t *out)
+{
+    uint32_t primask;
+    bool     ok = false;
+
+    if (out == NULL) {
+        return false;
+    }
+
+    /* 关中断拷贝, 防止 8 个字节被 ISR 在中间改掉 */
+    primask = __get_PRIMASK();
+    __disable_irq();
+    if (s_fb_ready) {
+        *out       = *(const gimbal_feedback_t *) &s_fb;
+        s_fb_ready = false;
+        ok         = true;
+    }
+    __set_PRIMASK(primask);
+
+    return ok;
+}
+
+/* ==========================================================================
+ * 初始化与中断
+ * ========================================================================== */
+
+void gimbal_init(void)
+{
+    /* SysConfig 只生成了外设级的中断使能 (DL_MCAN_enableInterrupt),
+     * NVIC 这一层没有生成, 必须自己开。漏掉的表现是"发得出去、收不回来",
+     * 而且不会有任何编译期或运行期报错 —— 很难查。
+     * 例程 mcan_message_rx.c 里也是手动调的这一句。 */
+    NVIC_EnableIRQ(MCAN0_INST_INT_IRQN);
+}
+
+void MCAN0_INST_IRQHandler(void)
+{
+    uint32_t status;
+
+    switch (DL_MCAN_getPendingInterrupt(MCAN0_INST)) {
+        case DL_MCAN_IIDX_LINE0:
+            /* 线中断是"或"的关系: 一次进来可能同时挂着好几个源,
+             * 所以先整体读出来, 逐个判, 最后一起清。 */
+            status = DL_MCAN_getIntrStatus(MCAN0_INST);
+
+            if ((status & DL_MCAN_INTR_SRC_RX_FIFO0_NEW_MSG) != 0u) {
+                gimbal_rx_drain();
+            }
+            if ((status & DL_MCAN_INTR_SRC_BUS_OFF_STATUS) != 0u) {
+                /* 总线进了 Bus-Off: 通常是接线错/没接终端电阻/电机没上电。
+                 * 恢复要等 CAN 协议规定的 128×11 个隐性位, 这里只计数,
+                 * 由上层决定要不要重新初始化。 */
+                g_gimbal_bus_off++;
+            }
+
+            DL_MCAN_clearIntrStatus(MCAN0_INST, status,
+                                    DL_MCAN_INTR_SRC_MCAN_LINE_0);
+            break;
+
+        default:
+            break;
+    }
+}
