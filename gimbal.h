@@ -129,4 +129,20 @@ extern volatile uint32_t g_gimbal_tx_fail;    /* 因"还在等反馈"而没发�
 extern volatile uint32_t g_gimbal_timeout;    /* 反馈超时次数 */
 extern volatile uint32_t g_gimbal_rx_err;     /* CRC错/ID不符/溢出 的帧数 */
 
+/* UART1 收到的【原始字节数】, 不管帧对不对、在不在等待窗口, 一律计数。
+ *
+ * 它是"电机到底有没有在发"的直接证据:
+ *     这个数一直是 0     -> 线上一个字节都没有, 问题在硬件 (接线/电机的 TX/电平)
+ *     它在涨但 M 是 0    -> 有数据进来但凑不成合法帧, 问题在协议 (CRC范围/帧长/时序)
+ *
+ * 只看 M 和 ME 是不够的: 只来了 3 个字节就断掉的话, 那两个都不会动。 */
+extern volatile uint32_t g_gimbal_rx_bytes;
+
+/* 最近收到的原始字节环, 专供排查。UART1 每收到一个字节就存进去 (含被 flush
+ * 丢掉的), 用十六进制打出来就能看清电机到底发的是什么。
+ * 读的时候无所谓顺序 —— 如果线上真是一帧一帧的, 这 16 个字节能看出帧结构。 */
+#define GIMBAL_SNOOP_LEN    16u
+extern volatile uint8_t g_gimbal_snoop[GIMBAL_SNOOP_LEN];
+extern volatile uint8_t g_gimbal_snoop_pos;
+
 #endif /* GIMBAL_H_ */

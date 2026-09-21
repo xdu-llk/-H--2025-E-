@@ -11,10 +11,22 @@
 #define GIMBAL_CRC_POLY      0x07u
 
 /* 等反馈的超时, 单位是 gimbal_poll() 的调用次数 (主循环 1 ms 一次)。
- * 115200 下一来一回约 1.3 ms, 10 ms 留了足够余量。
- * 电机不在线时这个值决定"发送被卡住多久" —— 10 ms 远小于 30 ms 的发送周期,
- * 所以即使电机彻底不响应, 发送节奏也不受影响。 */
-#define GIMBAL_RX_TIMEOUT_TICKS  10u
+ * 115200 下一来一回约 1.4 ms, 4 ms 有约 2.8 倍余量。
+ *
+ * ⚠️ 必须**小于发送周期(5 ms)** —— 否则电机不响应时, 每次发送都要干等整个
+ *    超时, 200 Hz 的节拍会被拖回 100 Hz, 平滑的意图就落空了。
+ *    若上板后 TO 一直涨, 说明电机的实际响应比预期慢, 那时再权衡这个值。 */
+/* 等反馈的超时, 单位是 gimbal_poll() 的调用次数 (主循环 1 ms 一次)。
+ *
+ * ⚠️ 设成**和发送周期一样长** (见 empty.c 的 SEND_PERIOD_TICKS), 让等待窗口
+ *    覆盖整个周期。这样几乎永远处于"等待中", 任何到达的字节都会被攒起来。
+ *
+ * 原来用较短的值 (4 ms / 10 ms), 本意是"等不到就放行, 好发下一条"。但那会
+ * 留出一段 IDLE 时间, 落在里面的字节全被丢弃 —— 如果电机的回复慢到那一段,
+ * 帧就永远攒不齐 (表现为 g_gimbal_rx_bytes 在涨、而 M 和 ME 都是 0)。
+ *
+ * ⚠️ 不能大于发送周期, 否则发不出下一条。改 SEND_PERIOD_TICKS 时这里要跟着改。 */
+#define GIMBAL_RX_TIMEOUT_TICKS  5u
 
 /* TX FIFO 满时的自旋上限, 防止 UART 时钟异常把主循环卡死 */
 #define GIMBAL_TX_GUARD      200000u
@@ -40,6 +52,17 @@ volatile uint32_t g_gimbal_rx_count = 0u;
 volatile uint32_t g_gimbal_tx_fail  = 0u;
 volatile uint32_t g_gimbal_timeout  = 0u;
 volatile uint32_t g_gimbal_rx_err   = 0u;
+volatile uint32_t g_gimbal_rx_bytes = 0u;
+
+volatile uint8_t  g_gimbal_snoop[GIMBAL_SNOOP_LEN];
+volatile uint8_t  g_gimbal_snoop_pos = 0u;
+
+/* 每收到一个字节 (无论用不用得上) 都存进环里 */
+static void gimbal_snoop_put(uint8_t byte)
+{
+    g_gimbal_snoop[g_gimbal_snoop_pos] = byte;
+    g_gimbal_snoop_pos = (uint8_t)((g_gimbal_snoop_pos + 1u) % GIMBAL_SNOOP_LEN);
+}
 
 /* ==========================================================================
  * CRC8
@@ -126,7 +149,8 @@ bool gimbal_send_cmd(uint8_t cmd, int16_t value)
      * 一上一轮超时后电机又慢吞吞回了半包, 那些字节会混进这次的反馈帧里,
      * 让 CRC 一直对不上。 */
     while (!DL_UART_Main_isRXFIFOEmpty(UART_1_INST)) {
-        (void) DL_UART_Main_receiveData(UART_1_INST);
+        gimbal_snoop_put((uint8_t) DL_UART_Main_receiveData(UART_1_INST));
+        g_gimbal_rx_bytes++;    /* 这里也必须计数, 否则 RB 是低估的 */
     }
 
     /* 顺序要紧: 先清长度、再切状态。反过来的话, 状态切到 WAITING 之后、
@@ -237,6 +261,11 @@ void UART_1_INST_IRQHandler(void)
         case DL_UART_IIDX_RX:
             while (!DL_UART_Main_isRXFIFOEmpty(UART_1_INST)) {
                 uint8_t byte = DL_UART_Main_receiveData(UART_1_INST);
+
+                /* 先记录再判断 —— 不管这字节用不用得上, 它都证明"线上有数据"。
+                 * 这是排查"电机到底发没发"最直接的证据。 */
+                g_gimbal_rx_bytes++;
+                gimbal_snoop_put(byte);
 
                 /* 一发一收: 没在等反馈时收到的字节一概丢弃。
                  * 不做长度判断的话, 一旦帧对不齐就会一直错下去。 */

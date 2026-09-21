@@ -101,6 +101,11 @@
 
 #include <stdio.h>
 
+/* 打开后每秒多打一行 UART1 收到的原始字节 (十六进制)。
+ * 用于排查"云台反馈收不到"—— 详见 docs/BUGS.md #1。
+ * 平时关着 (0), 免得刷屏。 */
+#define DEBUG_GIMBAL_SNOOP      0
+
 /* ==========================================================================
  * 时间基准
  * ========================================================================== */
@@ -109,22 +114,46 @@
 #define LOOP_TICK_CYCLES        32000u
 #define LOOP_TICK_SEC           0.001f
 
-/* 发送的**兜底周期**, 30 ms ≈ 33 Hz。
+/* 发送周期。5 ms = 200 Hz。
  *
- * 正常情况下发送是【事件驱动】的 —— 收到一帧视觉就立刻发 (见主循环)。
- * 这个周期只在两种情况下起作用:
- *   1. 视觉断流 (MaixCam 被关掉/掉线) 时维持 CAN 通信和陀螺前馈
- *   2. 视觉帧率偶尔掉到 33 Hz 以下时补一条
+ * ⚠️ 2026-09-20 从 30 ms 缩到 5 ms, 为了消除"步进阻塞感":
+ *    原来 33 Hz 发指令, 电机收到一个增量 -> 转过去 -> 停住 -> 等 28.6 ms
+ *    再收下一个, 肉眼可见一顿一顿。
+ *    拆细之后每秒转的总角度不变 (增益是速率形式), 但目标轨迹从 33 级台阶
+ *    变成 200 级, 明显平滑。
  *
- * 为什么必须保留这个兜底: QD4310 是应答模式, 收到控制报文才回反馈报文。
- * 完全靠视觉驱动的话, 视觉一停云台就既不收指令也不回反馈, 状态全瞎
- * (手册 5.3.3 也推荐定时触发)。 */
-#define SEND_PERIOD_TICKS       30u
+ * 代价: UART 负载 200 × 15 字节 = 3000 B/s, 115200 下约 26%。可接受。
+ * 往返约 1.4 ms < 5 ms, 所以"一发一收"不会挡住这个节拍。
+ *
+ * 发送仍然是【事件驱动】优先 —— 收到新视觉帧立刻发; 这个周期是兜底, 负责
+ * 视觉帧之间 (以及视觉断流时) 继续推进。 */
+/* 发送周期。5 ms = 200 Hz。
+ *
+ * ⚠️ 2026-09-20 从 30 ms 缩到 5 ms, 为了消除"步进阻塞感":
+ *    原来 33 Hz 发指令, 电机收到一个增量 -> 转过去 -> 停住 -> 等 28.6 ms
+ *    才收下一个, 肉眼可见一顿一顿。
+ *    拆细之后每秒转的总角度不变 (增益是速率形式), 但目标轨迹从 33 级台阶
+ *    变成 200 级, 明显平滑。
+ *
+ * 代价: UART 负载 200 × 15 字节 = 3000 B/s, 115200 下约 26%。可接受。
+ *
+ * 发送仍然是【事件驱动】优先 —— 收到新视觉帧立刻发; 这个周期是兜底, 负责
+ * 视觉帧之间 (以及视觉断流时) 继续推进。 */
+#define SEND_PERIOD_TICKS       5u
 #define SEND_PERIOD_SEC         ((float) SEND_PERIOD_TICKS * LOOP_TICK_SEC)
 
 /* 多久没收到反馈/陀螺数据就认为掉线。单位节拍。 */
 #define GIMBAL_LOST_TICKS       300u   /* 300 ms */
 #define GYRO_LOST_TICKS         100u   /* 100 ms —— 陀螺上报率远高于此 */
+
+/* 云台健康检查开关 (基于反馈报文)。
+ *
+ * ⚠️ 现在设为 0 (关)。原因: 云台反馈收不到 (见 docs/BUGS.md #1), gim_lost 会
+ *    一直涨, 于是每 300 ms 就重发一次"清错误 + 使能" —— 白白挤掉两条瞄准指令,
+ *    还会反复给电机发使能。联调时会看到每 300 ms 抖一下, 容易误判成控制问题。
+ *
+ * 等反馈那个 bug 修好 (M 能正常涨) 之后, 改回 1 打开。 */
+#define GIMBAL_HEALTH_CHECK     0
 
 /* ==========================================================================
  * 云台初始化/恢复序列
@@ -158,23 +187,30 @@
  *
  *     Δθ_vision = AIM_GAIN_RATE × err_x × dt
  *
- * 与像素焦距 f、收敛时间常数 τ 的关系:   AIM_GAIN_RATE = 1 / (τ · f)
- * 与每拍收敛比例 λ 的关系:               λ = AIM_GAIN_RATE · f · SEND_PERIOD_SEC
+ * 与像素焦距 f、每拍收敛比例 λ 的关系:
+ *     AIM_GAIN_RATE = λ / (f · SEND_PERIOD_SEC)
  *
  * ⚠️ 必须定义成"速率"而不是"每帧多少弧度":
  *    增量式指令下, 真正决定环路增益的是【每帧增量 ÷ 发送周期】。
- *    按"每帧 +0.0015 rad"写的话, 把发送周期从 30ms 改成 5ms, 环路增益直接
- *    ×6, 控制器就振荡了。定义成速率之后, 改频率不影响闭环。
+ *    按"每帧多少 rad"写的话, 把发送周期从 30ms 改成 5ms, 增益直接 ×6 振荡。
  *
- * 标定 f: 靶纸固定在工作距离, 让云台转一个已知角度 Δθ, 读 err_x 的变化 Δpx,
- *         则 f = Δpx / Δθ。例: 转 0.1 rad 靶心移动 30 px -> f = 300 px。
+ * f 的来源 (2026-09-20 按官方参数推算, 非实测):
+ *     MaixCam2 的 OS04D10: 2560x1440, 水平 FOV 81°。
+ *     416x260 输出按 1.6 宽高比居中裁剪 -> 水平视野 75.1° -> f ≈ 271 px。
+ *     (416x416 那个模式裁到 51.3° -> f ≈ 433 px, 只用于认数字, 不参与控制)
  *
- * ⚠️ 下面 0.05 是按 f ≈ 300 px 反推的:
- *        τ = 1/(0.05 × 300) ≈ 67 ms
- *        λ = 0.05 × 300 × 0.03 = 0.45   <-- 偏激进, 会有轻微振铃
- *    上板标定 f 之后, 建议先把 λ 压到 0.25~0.3 试, 稳了再往上加。
- *    例: f=300, 想要 λ=0.25 -> AIM_GAIN_RATE = 0.25/(300 × 0.03) ≈ 0.028 */
-#define AIM_GAIN_RATE           0.05f
+ * λ 的含义: 每拍把误差消掉多少比例。带一个采样延迟的闭环特征方程:
+ *     z² − z + λ = 0
+ *     λ < 0.25     -> 两个实根, 无振荡
+ *     λ ∈ (0.25,1) -> 共轭复根, 模 √λ, 稳定但有振铃
+ *
+ * 当前取 λ = 0.30 (0.30 / (271 × 0.03) = 0.037)。
+ * 原值 0.05 对应 λ = 0.41, 偏激进。
+ *
+ * ⚠️ f 是【推算值】, 前提是 MaixPy 按"居中裁剪"处理宽高比。实测校验法:
+ *     靶纸水平平移 50mm, 1m 处 err_x 应变化约 271 × 0.05 / 1 ≈ 13.5 px。
+ *     对不上就按实际比例改这个常量。 */
+#define AIM_GAIN_RATE           0.037f
 
 /* 死区, 像素。err_x 是量化过的像素值, 零附近有 ±1~2 px 的抖动,
  * 不设死区的话积分器会追着噪声随机游走。
@@ -249,6 +285,24 @@ static bool aim_step(bool err_valid, float err_x_px,
  * 主程序
  * ========================================================================== */
 
+/* ==========================================================================
+ * 激光控制
+ * ---------------------------------------------------------------------------
+ * PA2 接激光笔的 MOS 管栅极。GPIO 在 SysConfig 里配成 Output + 上电 Cleared +
+ * 内部下拉 —— 所以在程序接管之前, 栅极不会被拉高, 激光不会意外点亮。
+ *
+ * 当前策略: **上电即常亮**(视觉部分一开就跟着开)。
+ * 若以后要按区段开关 (例: 只在 2→3、4→1 两段亮), 改这里的调用点即可。
+ * ========================================================================== */
+static void laser_set(bool on)
+{
+    if (on) {
+        DL_GPIO_setPins(GPIO_LASER_PORT, GPIO_LASER_LASER_PIN);
+    } else {
+        DL_GPIO_clearPins(GPIO_LASER_PORT, GPIO_LASER_LASER_PIN);
+    }
+}
+
 int main(void)
 {
     uint16_t send_tick = 0;
@@ -259,6 +313,9 @@ int main(void)
     uint16_t dbg_tick = 0;
     uint32_t vcount = 0;        /* 视觉帧计数, 只为调试打印 */
     uint16_t vis_gap_max = 0;   /* 本报告周期内最大的视觉帧间隔 (ms) */
+    uint8_t  di = 0;            /* 字节转储的循环下标 */
+    float    rabs_sum = 0.0f;   /* 本报告周期内 |角速度| 的累加和 */
+    uint16_t rabs_cnt = 0;      /* 参与累加的样本数 */
 #endif
 
     float    err_x     = 0.0f;
@@ -274,6 +331,8 @@ int main(void)
     gimbal_init();
     gyro_link_init();
     vision_link_init();
+
+    laser_set(true);        /* 当前策略: 常亮 */
 
     /* 开机触发一次"清错误 -> 使能"序列。真正的发送由主循环逐步推进,
      * 原因见下面 gim_step 的说明。 */
@@ -323,6 +382,12 @@ int main(void)
         if (gyro_link_get(&gmsg)) {
             gyro_lost = 0;
             yaw_rate  = gyro_raw_to_dps(gmsg.gyro_raw[GYRO_FF_AXIS]);
+#if DEBUG_PRINT_ENABLE
+            /* 累加 |角速度|, 报告时给出本周期平均值 —— 标定 GYRO_LSB_PER_DPS 要用。
+             * 取绝对值是因为手动转的时候正负都有, 要看的是"转得多快"。 */
+            rabs_sum += (yaw_rate < 0.0f) ? -yaw_rate : yaw_rate;
+            rabs_cnt++;
+#endif
         } else if (gyro_lost < 0xFFFFu) {
             gyro_lost++;
         }
@@ -372,12 +437,15 @@ int main(void)
             send_tick = 0;
             need_send = false;
 
+#if GIMBAL_HEALTH_CHECK
             if ((gim_step == GIM_STEP_IDLE) && (gim_lost >= GIMBAL_LOST_TICKS)) {
                 /* 反馈断了一阵 —— 云台掉线或被失能。触发一次"清错误 + 使能"。
                  * 只置状态、不在这里发, 因为一发一收下两条不能背靠背发。 */
                 gim_lost = 0;
                 gim_step = GIM_STEP_CLEAR;
-            } else if (gim_step != GIM_STEP_IDLE) {
+            } else
+#endif
+            if (gim_step != GIM_STEP_IDLE) {
                 /* 初始化序列正在跑, 这一拍不占发送机会, 让给序列 */
             } else {
                 /* 陀螺掉线时把前馈置无效, 别拿陈旧角速度继续猛补 */
@@ -404,7 +472,7 @@ int main(void)
          */
         if (++dbg_tick >= DEBUG_PERIOD_TICKS) {
             dbg_tick = 0;
-            printf("V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu | E=%ld R=%ld\r\n",
+            printf("V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld R=%ld |R|=%ld\r\n",
                    (unsigned long) vcount,
                    (unsigned long) g_vision_bad_csum,
                    (unsigned long) g_vision_overrun,
@@ -413,9 +481,28 @@ int main(void)
                    (unsigned long) g_gimbal_rx_count,
                    (unsigned long) g_gimbal_timeout,
                    (unsigned long) g_gimbal_rx_err,
+                   (unsigned long) g_gimbal_rx_bytes,
                    (long) err_x,
-                   (long) yaw_rate);
+                   (long) yaw_rate,
+                   (long) ((rabs_cnt > 0u) ? (rabs_sum / (float) rabs_cnt) : 0.0f));
             vis_gap_max = 0;        /* 每个报告周期重新统计 */
+            rabs_sum = 0.0f;
+            rabs_cnt = 0;
+
+#if DEBUG_GIMBAL_SNOOP
+            /* UART1 最近收到的原始字节 (最旧 -> 最新)。看电机到底发的是什么:
+             * 如果线上真是一帧一帧的, 这行里能直接看出帧结构 (ID/状态/角度/CRC)。
+             * 排查"云台反馈收不到"时把它打开 —— 见 docs/BUGS.md #1。 */
+            printf("  RX1:");
+            for (di = 0u; di < GIMBAL_SNOOP_LEN; di++) {
+                uint8_t idx = (uint8_t) ((g_gimbal_snoop_pos + di) %
+                                         GIMBAL_SNOOP_LEN);
+                printf(" %02x", g_gimbal_snoop[idx]);
+            }
+            printf("\r\n");
+#else
+            (void) di;
+#endif
         }
 #endif
 

@@ -179,7 +179,7 @@ CLOSE_KERNEL_SIZE = 5
 # 还可能更大，而选框规则是"取最大"，于是它们能顶掉靶纸（表现为画面跳变）。
 # 这道副作用由下面的 MIN_RING_OVERLAP 挡。
 # 想单独验证"断口到底该谁补"，可以临时改成 False 对比：关掉后黑框的断口会露出来。
-USE_CANNY = True
+USE_CANNY = False
 CANNY_LOW = 50
 CANNY_HIGH = 150
 
@@ -224,7 +224,7 @@ THRESH_MODE = "fixed"
 #
 # ⚠️ 不要为了"让框闭合"去抬 T —— 抬 T 会让背景大量涌进来（这是反二值化，
 # 比 T 暗的算前景，T 越大进来的越多）。框断口应该交给 Canny 和闭运算补。
-FIXED_THRESHOLD = 95
+FIXED_THRESHOLD = 130
 
 # --- 初筛 ---
 # 最小轮廓面积(px^2)，416x260 下。
@@ -350,7 +350,7 @@ MM_PER_PX_RECT = TARGET_WIDTH_MM / RECT_W           # 约 0.667 mm/px
 # err_x = 靶心 - 激光点。两者同号。
 LASER_X_PX = CAM_W / 2.0        # 默认取画面中心；标定后改成实测像素 x
 LASER_Y_PX = CAM_H / 2.0        # 仅用于绘制，竖直方向不参与控制
-ERR_X_SIGN = -1                 # 2026-09-21 实测反了（偏右时云台往顺时针转，正反馈），改成 -1
+ERR_X_SIGN = -1                  # 云台转向装反时改成 -1
 
 # --- 串口（沿用原有 6 字节协议，未改动）---
 UART_DEVICE = "/dev/ttyS4"
@@ -382,7 +382,7 @@ PROFILE_EVERY = 15              # 只用来定控制台那份的间隔（每 15*
 # 用这个开关，**不要去注释代码** —— 上次注释多了一行，把 show_img = img 也注掉，
 # 板子直接 UnboundLocalError 崩了。
 DRAW_RESULT = True
-DEBUG_TOUCH = False              # 触摸打点显示该点灰度与二值化判定
+DEBUG_TOUCH = False             # 触摸打点显示该点灰度与二值化判定
 DEBUG_BIN_BUTTON = False         # 右上角放一个按钮：点一下在"原图/二值图"之间切换
 BIN_BTN_W = 84                  # 按钮尺寸
 BIN_BTN_H = 26
@@ -440,10 +440,15 @@ def init_uart():
 PROFILE_DATA = {
     "preprocess": 0.0, "find": 0.0, "homography": 0.0, "total": 0.0,
     "findcontours": 0.0, "approx": 0.0, "gates": 0.0,
+    # child = largest_child_area（循环内，每个候选一次）
+    # childq = _largest_child_quad（循环后，一次）—— 以前没被计时
+    "child": 0.0, "childq": 0.0,
     # contours = 轮廓总数；cand = 过了面积/周长门槛、真正开始走 8 道闸的候选数。
     # 帧率随场景波动很大（同一份参数能差好几倍），所以需要一个【跟场景无关】的
     # 指标来判断 MIN_AREA 到底挡掉了多少 —— 这两个数就是干这个的。
     "contours": 0, "cand": 0,
+    # 漏斗：过面积/过周长/过贴合/过几何/过长宽比/过填充/过暗区 各剩几个
+    "funnel": (0, 0, 0, 0, 0, 0, 0),
 }
 
 
@@ -507,15 +512,21 @@ def preprocess(frame_rgb):
     if CLOSE_KERNEL_SIZE and CLOSE_KERNEL_SIZE >= 3:
         region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, _get_kernel(CLOSE_KERNEL_SIZE))
 
-    # --- 通道 B：边界（哪里灰度跳变）---
+    # --- 通道 B：从【闭合后的二值图】取轮廓 ---
+    # ⚠️ Canny 的输入是 region（二值图），不是 blur（灰度图）。
+    # 在灰度图上取边会把背景的每一条纹理都描出来 —— 那些线围出一堆碎轮廓，
+    # 每个都要走一遍后面 8 道闸，实测杂乱场景能到 170 个。二值图上没有纹理，
+    # 只有"够黑的块"，取出来的边自然干净。
+    #
+    # 补断口是【闭运算】的活，不是 Canny 的 —— Canny 不改变白色的形状，
+    # 它只是把块描成一圈 1 像素的线。
     if USE_CANNY:
-        edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
-        combined = cv2.bitwise_or(region, edges)   # 任一路说有就算有
+        combined = cv2.Canny(region, CANNY_LOW, CANNY_HIGH)
     else:
         combined = region
 
     # 返回两路：combined 用来找轮廓；region 留着给 find_target_rect 做
-    # "这个轮廓是不是压在暗区上"的检查（挡 Canny 描出来的背景矩形）
+    # "这个轮廓是不是压在暗区上"的检查
     return region, combined
 
 
@@ -691,14 +702,19 @@ def find_target_rect(combined, region=None):
     grown_region = None     # 真要判的时候才膨胀一次，见 ring_overlap_ratio
     frames = []
     approx_sec = 0.0        # 只累计 approximate_quad 自己的时间
+    child_sec = 0.0         # 只累计 largest_child_area 自己的时间
     n_cand = 0              # 过了面积+周长门槛、开始走后面 8 道闸的候选个数
+    # 各道闸过掉多少个（用来定位耗时：3 个贵操作各被调了几次）
+    na = np0 = nf = ng = nasp = nfill = nring = 0
     for idx, contour in enumerate(contours):
         area = cv2.contourArea(contour)
         if area < MIN_AREA:
             continue
+        na += 1                                     # arcLength 被调用的次数
         perimeter = cv2.arcLength(contour, True)
         if perimeter < MIN_PERIMETER:
             continue
+        np0 += 1                                    # minAreaRect 被调用的次数
 
         # 便宜的形状预筛 —— 插在 approximate_quad 之前。
         # 碎块在这里就被扔掉：后面的凸包、7 次 approxPolyDP、以及那 8 道闸
@@ -707,6 +723,7 @@ def find_target_rect(combined, region=None):
             continue
 
         n_cand += 1
+        nf += 1                                     # approximate_quad 被调用的次数
 
         ta = pytime.perf_counter()
         approx = approximate_quad(contour, perimeter, area)
@@ -717,6 +734,7 @@ def find_target_rect(combined, region=None):
         quad = approx.reshape(4, 2).astype(np.float32)
         if not check_rectangle_geometry(quad):
             continue
+        ng += 1
 
         _, _, w, h = cv2.boundingRect(approx)
         if h == 0:
@@ -724,10 +742,16 @@ def find_target_rect(combined, region=None):
         aspect = w / float(h)
         if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
             continue
+        nasp += 1
 
-        # "是框不是块"的判据，见 frame_fill_ratio() 的说明
-        if frame_fill_ratio(contour, combined, scratch) > MAX_FRAME_FILL:
+        # "是框不是块"的判据，见 frame_fill_ratio() 的说明。
+        # ⚠️ 必须拿 region（真正的暗区）去测，不能拿 combined ——
+        # combined 是"Canny 描出来的一圈线"，那里实心块【中间是空的】，
+        # 看上去和一个中空的框一模一样，这道闸就废了（实测实心块会被误检）。
+        base = region if region is not None else combined
+        if frame_fill_ratio(contour, base, scratch) > MAX_FRAME_FILL:
             continue
+        nfill += 1
 
         # "这个框是压在暗区上的吗" —— 挡掉 Canny 描出来的背景矩形
         if region is not None and MIN_RING_OVERLAP > 0:
@@ -735,22 +759,28 @@ def find_target_rect(combined, region=None):
                 grown_region = cv2.dilate(region, _get_kernel(RING_GROW_SIZE))
             if ring_overlap_ratio(contour, grown_region, scratch) < MIN_RING_OVERLAP:
                 continue
+        nring += 1
 
         # 内外轮廓互相印证：比值过低说明外框被背景污染撑大了（框粘连）。
         # 只在"确实有内孔"时才能判；框断掉时外轮廓没有子轮廓，跳过。
         if MIN_INNER_OUTER_RATIO > 0:
+            tc = pytime.perf_counter()
             child_area = largest_child_area(contours, hierarchy, idx)
+            child_sec += pytime.perf_counter() - tc
             if child_area >= MIN_AREA:
                 if child_area / area < MIN_INNER_OUTER_RATIO:
                     continue
 
         frames.append({"idx": idx, "quad": quad, "area": area})
 
-    # find 拆账：循环总时间 = 拟合四边形 + 各道闸
+    # find 拆账：循环总时间 = 拟合四边形 + 找子轮廓 + 各道闸
     loop_ms = (pytime.perf_counter() - t_fc_end) * 1000.0
     PROFILE_DATA["approx"] = approx_sec * 1000.0
-    PROFILE_DATA["gates"] = loop_ms - PROFILE_DATA["approx"]
+    PROFILE_DATA["child"] = child_sec * 1000.0
+    PROFILE_DATA["gates"] = loop_ms - PROFILE_DATA["approx"] - PROFILE_DATA["child"]
     PROFILE_DATA["cand"] = n_cand
+    # 逐步漏斗：过面积 -> 过周长 -> 过贴合 -> 过几何 -> 过长宽比 -> 过填充 -> 过暗区
+    PROFILE_DATA["funnel"] = (na, np0, nf, ng, nasp, nfill, nring)
 
     if not frames:
         return None
@@ -760,32 +790,50 @@ def find_target_rect(combined, region=None):
     # 干扰框（细边框画框、显示器边框）误当成靶纸。本题场景中靶纸是视野里的
     # 主导物体，取最大更稳。
     outer = max(frames, key=lambda r: r["area"])
+    # _largest_child_quad 在循环【之后】跑，以前完全没被计时 ——
+    # find 的耗时减去那三块之后剩下的那几毫秒，就是它。
+    tq = pytime.perf_counter()
+    inner = _largest_child_quad(contours, hierarchy, outer["idx"])
+    PROFILE_DATA["childq"] = (pytime.perf_counter() - tq) * 1000.0
     return (
         sort_corners(outer["quad"]),
-        _largest_child_quad(contours, hierarchy, outer["idx"]),
+        inner,
         outer["area"],
         "frame",
     )
 
 
+def _local_tile(contour, shape, pad):
+    """把轮廓裁到它自己的外接矩形（四周留 pad），并平移到局部坐标。
+
+    为什么必须裁：这两个函数原来都在【整幅图】上做 drawContours + bitwise_and +
+    countNonZero —— 每次调用要清零 108KB、再扫几遍整幅图。而设备实测这 6 次调用
+    （2 个候选 × 3 个函数）就吃掉 9ms。裁到外接矩形后，小候选的运算量能少几十倍。
+    结果完全一样，只是范围小了。
+    """
+    x, y, w, h = cv2.boundingRect(contour)
+    H, W = shape[:2]
+    x0 = max(0, x - pad); y0 = max(0, y - pad)
+    x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+    return (x0, y0, x1, y1), np.ascontiguousarray(contour - (x0, y0), dtype=np.int32)
+
+
 def frame_fill_ratio(contour, combined, scratch):
     """外框内部的前景占比。实心块接近 1，中空的框很小。
 
-    这是"是框不是块"的判据。**为什么不用父子轮廓面积比**：
-    靶纸内部的同心圆被自适应阈值判成前景后，闭合的圆环会把面板内部的黑区分割
-    成一圈圈窄环带，黑框的"内孔"于是被切碎，面积比远低于阈值而被误判为干扰
-    （实测真实靶纸照片直接掉到 outer-only，抗干扰完全失效）。
-    江南代码用固定阈值 35 + 锁曝光，红色圆环灰度约 150 进不了二值图，内孔保持
-    完整，所以父子面积比在那里成立；自适应阈值对局部对比度敏感，没有这个前提。
+    这是"是框不是块"的判据 —— 填充外轮廓后统计内部前景占比，与内孔是否被切碎无关。
 
-    填充外轮廓后统计内部前景占比，与内孔是否被切碎无关，因此更稳。
+    只在轮廓自己的外接矩形里算，见 _local_tile()。
     """
-    scratch[:] = 0
-    cv2.drawContours(scratch, [contour], -1, 255, thickness=cv2.FILLED)
-    inside = cv2.countNonZero(scratch)
+    (x0, y0, x1, y1), local = _local_tile(contour, combined.shape, 2)
+    tile = scratch[y0:y1, x0:x1]
+    tile[:] = 0
+    cv2.drawContours(tile, [local], -1, 255, thickness=cv2.FILLED)
+    inside = cv2.countNonZero(tile)
     if inside <= 0:
         return 1.0
-    foreground = cv2.countNonZero(cv2.bitwise_and(combined, scratch))
+    crop = np.ascontiguousarray(combined[y0:y1, x0:x1])
+    foreground = cv2.countNonZero(cv2.bitwise_and(crop, tile))
     return foreground / float(inside)
 
 
@@ -805,13 +853,19 @@ def ring_overlap_ratio(contour, grown_region, scratch):
     结果完全一样，只是不再白做功。
     膨胀的理由：阈值通常只抓到黑框的一部分（反光处漏掉），膨胀一下才不会
     把框上没抓到的那些段误判成"不在暗区"。
+
+    只在轮廓自己的外接矩形里算，见 _local_tile()。线宽是 3，笔迹会超出
+    外接矩形 1 像素，所以 pad 取 3 兜住。
     """
-    scratch[:] = 0
-    cv2.drawContours(scratch, [contour], -1, 255, thickness=3)
-    ring = cv2.countNonZero(scratch)
+    (x0, y0, x1, y1), local = _local_tile(contour, grown_region.shape, 3)
+    tile = scratch[y0:y1, x0:x1]
+    tile[:] = 0
+    cv2.drawContours(tile, [local], -1, 255, thickness=3)
+    ring = cv2.countNonZero(tile)
     if ring <= 0:
         return 0.0
-    hit = cv2.countNonZero(cv2.bitwise_and(grown_region, scratch))
+    crop = np.ascontiguousarray(grown_region[y0:y1, x0:x1])
+    hit = cv2.countNonZero(cv2.bitwise_and(crop, tile))
     return hit / float(ring)
 
 
@@ -990,17 +1044,13 @@ def _draw_quad(img, quad, color):
         img.draw_line(x1, y1, x2, y2, color, thickness=2)
 
 
-def _draw_cross(img, x, y, color, size=10, thickness=2):
-    ix, iy = int(x), int(y)
-    img.draw_line(ix - size, iy, ix + size, iy, color, thickness=thickness)
-    img.draw_line(ix, iy - size, ix, iy + size, color, thickness=thickness)
-
-
 def draw_result(img, result):
-    """把检测结果叠到 maix 图像上。"""
-    # 激光点始终画出来：它是物理标定的固定像素，是误差的基准
-    _draw_cross(img, LASER_X_PX, LASER_Y_PX, image.COLOR_YELLOW, size=10)
+    """把检测结果叠到 maix 图像上。
 
+    只留三样：绿框（锁定的四边形）、蓝框（内孔，只在锁外框时才出现）、
+    靶心红点。激光点十字、靶心竖线、激光到靶心的连线都去掉了 —— 那些是
+    给人看"偏了多少"的，而 err_x 那行字已经把它变成数字了。
+    """
     if not result["found"]:
         img.draw_string(8, 8, "NO TARGET", image.COLOR_RED, scale=1)
         return
@@ -1010,13 +1060,7 @@ def draw_result(img, result):
         _draw_quad(img, result["inner"], image.COLOR_BLUE)
 
     cx, cy = result["center"]
-    # 中央竖线：靶心处的短竖线，直观对应题目的判据
-    img.draw_line(int(cx), int(cy) - 16, int(cx), int(cy) + 16, image.COLOR_RED, thickness=2)
     img.draw_circle(int(cx), int(cy), 3, image.COLOR_RED, thickness=-1)
-    # 激光点到靶心的连线，长度即水平误差
-    img.draw_line(
-        int(cx), int(cy), int(LASER_X_PX), int(LASER_Y_PX), image.COLOR_YELLOW, thickness=1
-    )
 
     err_mm = result["err_x_mm"]
     color = image.COLOR_GREEN if abs(err_mm) <= 30.0 else image.COLOR_RED
@@ -1512,13 +1556,20 @@ def run_find_rects():
                 )
             )
             print(
-                "           find %.1fms 拆开 = 找轮廓 %.1f + 拟合四边形 %.1f"
-                " + 各道闸 %.1f | 轮廓 %d 个, 过门槛 %d 个"
+                "           find %.1fms = 找轮廓 %.1f + 拟合四边形 %.1f"
+                " + 找子轮廓 %.1f + 各道闸 %.1f + 选完之后 %.1f | 轮廓 %d 个, 过门槛 %d 个"
                 % (
                     PROFILE_DATA["find"], PROFILE_DATA["findcontours"],
-                    PROFILE_DATA["approx"], PROFILE_DATA["gates"],
+                    PROFILE_DATA["approx"], PROFILE_DATA["child"],
+                    PROFILE_DATA["gates"], PROFILE_DATA["childq"],
                     PROFILE_DATA["contours"], PROFILE_DATA["cand"],
                 )
+            )
+            f = PROFILE_DATA["funnel"]
+            print(
+                "           漏斗: 面积%d -> 周长%d -> 贴合%d -> 几何%d"
+                " -> 长宽比%d -> 填充%d -> 暗区%d"
+                % f
             )
 
     print("退出")
