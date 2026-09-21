@@ -1,0 +1,9 @@
+- [Vision capability](vision-capability.md) — deepseek-flash reads images natively; no vision bridge needed, read pasted images directly
+- [Verify before generalizing](verify-before-generalizing.md) — flaky relays: measure 3+ times with a control before declaring what works
+- [Board is LCKFB 天猛星](board-is-lckfb-tianmengxing.md) — an MSPM0G3507 board, but NOT a TI LaunchPad; don't reuse the LP-MSPM0G3507 pinout
+- [SysConfig version alignment](sysconfig-version-alignment.md) — projects pin 1.26.2, the MCP runs 1.28.1; bump the project up when openFile refuses or the DMA-channel dropdown crashes
+- [LCKFB tutorial source](lckfb-tutorial-source.md) — the user follows wiki.lckfb.com lessons for the 天猛星 board, and that domain is unfetchable from here
+- [Project: 电赛 E 题云台瞄准](project-e-ti-aiming.md) — my_ti_control 三块板/四路串口的分工、进度与待办；只做辅助执行，勿重复展开方案设计
+- [SysConfig 不生成 NVIC 使能](mspm0-sysconfig-nvic-gotcha.md) — 每加一个用中断的外设，必须手动 NVIC_EnableIRQ，漏了就是"能发不能收"且零报错
+- [QD4310 UART 一发一收](qd4310-uart-one-shot-protocol.md) — 两条指令不能背靠背发；等待窗口必须等于发送周期
+- [电赛官网需要 Referer](nuedc-site-requires-referer.md) — 赛题正文是图片，下载必须带 Referer，否则 403
