@@ -188,6 +188,28 @@
 #define AIM_MAX_RATE_RAD_S      1.67f
 
 /* ==========================================================================
+ * 视觉误差 2 态卡尔曼滤波
+ * ---------------------------------------------------------------------------
+ * err_x 有 ±3 px 抖动, 直接累加进 yaw_ref 会让云台抖。
+ *
+ * 为什么用卡尔曼而不是"取平均": 它多估一个【变化率】状态, 能做预测,
+ * 平滑的同时滞后小得多 —— 平均/低通只能"平滑过去", 它能"外推现在"。
+ *
+ * 状态 x = [误差(px), 误差变化率(px/s)]   观测 = 误差(px)
+ * ========================================================================== */
+
+/* 观测噪声方差 = σ²。实测靶纸静止时 err_x 在 ±3 px 跳 -> σ≈2 -> R=4 */
+#define KF_R            4.0f
+
+/* 过程噪声。越大越信观测(跟得快、但噪声大)。
+ * Q_POS 管误差, Q_RATE 管变化率 —— 变化率给大点, 让速度估计跟得上 */
+#define KF_Q_POS        0.5f
+#define KF_Q_RATE       10.0f
+
+/* 目标丢失超过这么久(ms)就复位滤波器, 免得重新捕获时旧状态造成跳变 */
+#define KF_RESET_TICKS  200u
+
+/* ==========================================================================
  * 航向环 (IMU 角度闭环) —— 参考江南大学方案
  * ---------------------------------------------------------------------------
  * 江南: 角度PID(反馈=IMU角度) -> 速度PID(反馈=IMU角速度) -> 力矩
@@ -234,6 +256,58 @@
 /* ==========================================================================
  * 外环
  * ========================================================================== */
+
+/* --- 视觉误差滤波器状态 (2 态卡尔曼) --- */
+static float s_kf_x0 = 0.0f;    /* 误差 (px) */
+static float s_kf_x1 = 0.0f;    /* 误差变化率 (px/s) */
+static float s_kf_a  = 1.0f;    /* 协方差 P = [a b; b c] */
+static float s_kf_b  = 0.0f;
+static float s_kf_c  = 1.0f;
+static bool  s_kf_on = false;   /* false = 还没初始化, 下次观测直接采纳 */
+
+/* 喂一个新观测, 返回滤波后的误差。dt = 距上一帧的秒数。
+ * ⚠️ 目标丢失期间【不要】调用 —— 状态会一直外推跑飞。 */
+static float vision_filter(float z, float dt)
+{
+    float a, b, c, s, k0, k1, innov;
+
+    if (!s_kf_on) {                 /* 首次观测: 直接采纳, 速度置 0 */
+        s_kf_x0 = z;
+        s_kf_x1 = 0.0f;
+        s_kf_a  = 1.0f;
+        s_kf_b  = 0.0f;
+        s_kf_c  = 1.0f;
+        s_kf_on = true;
+        return z;
+    }
+
+    /* --- 预测 --- */
+    s_kf_x0 += s_kf_x1 * dt;
+    a = s_kf_a + dt * (s_kf_b + s_kf_b) + KF_Q_POS;
+    b = s_kf_b + dt * s_kf_c;
+    c = s_kf_c + KF_Q_RATE;
+
+    /* --- 更新 --- */
+    s     = a + KF_R;
+    k0    = a / s;
+    k1    = b / s;
+    innov = z - s_kf_x0;            /* 新息: 观测 - 预测 */
+
+    s_kf_x0 += k0 * innov;
+    s_kf_x1 += k1 * innov;
+
+    s_kf_a = a - k0 * a;
+    s_kf_b = b - k0 * b;
+    s_kf_c = c - k1 * b;
+
+    return s_kf_x0;
+}
+
+/* 复位滤波器。目标重新捕获时调用, 免得旧状态造成位置跳变 */
+static void vision_filter_reset(void)
+{
+    s_kf_on = false;
+}
 
 /* 角度环的积分状态 */
 static float g_yaw_i = 0.0f;
@@ -327,7 +401,9 @@ int main(void)
     uint16_t rabs_cnt = 0;      /* 参与累加的样本数 */
 #endif
 
-    float    err_x     = 0.0f;
+    float    err_x     = 0.0f;   /* 原始误差 (调试用) */
+    float    err_x_f   = 0.0f;   /* 卡尔曼滤波后的误差 —— 控制用这个 */
+    uint16_t tgt_lost  = 0;      /* 连续丢靶的帧数, 用来决定何时复位滤波器 */
     bool     err_valid = false;
     float    yaw_rate  = 0.0f;  /* °/s */
     float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
@@ -364,6 +440,12 @@ int main(void)
 
         /* --- 视觉 --- */
         if (vision_link_get(&vmsg)) {
+            /* 距上一帧的秒数 —— 卡尔曼的预测步要用。必须在 vis_lost 清零前算。
+             * 帧间隔异常(丢帧/启动)时退回标称值, 免得速度估计被带偏。 */
+            float dt_vis = (float) vis_lost * LOOP_TICK_SEC;
+            if (dt_vis < 0.005f || dt_vis > 0.2f) {
+                dt_vis = 0.0285f;
+            }
 #if DEBUG_PRINT_ENABLE
             /* 用【上一次】的 vis_lost 当帧间隔 —— 它就是"距上一帧过了多少 ms"。
              * 必须在清零之前读。取一个报告周期内的最大值, 用来抓帧率抖动。 */
@@ -375,12 +457,20 @@ int main(void)
             vis_lost  = 0;
             need_send = true;       /* 有新帧 -> 这一拍立刻发出去 */
             if (vmsg.status == VISION_STATUS_TARGET_VALID) {
-                err_x     = (float) vmsg.err_x;
+                err_x = (float) vmsg.err_x;      /* 原始值, 调试用 */
+                if (tgt_lost >= KF_RESET_TICKS) {
+                    vision_filter_reset();       /* 丢太久, 重新捕获 -> 复位 */
+                }
+                err_x_f   = vision_filter(err_x, dt_vis);   /* 滤波后, 控制用 */
                 err_valid = true;
+                tgt_lost  = 0;
             } else {
                 /* 丢靶。⚠️ err_x 恒为 0 是"无数据"不是"已对准", 必须用
-                 * err_valid 区分开。视觉项归零后, 速率项继续维持自稳。 */
+                 * err_valid 区分开。视觉项归零后, 航向环继续维持自稳。 */
                 err_valid = false;
+                if (tgt_lost < 0xFFFFu) {
+                    tgt_lost++;
+                }
             }
         } else if (vis_lost < 0xFFFFu) {
             vis_lost++;
@@ -489,10 +579,10 @@ int main(void)
                 bool rate_ok = (gyro_lost < GYRO_LOST_TICKS);
 
 #if !YAW_HOLD_ONLY
-                /* 阶段 2: 视觉驱动目标航向 —— err_x 累加到 yaw_ref 上 */
+                /* 阶段 2: 视觉驱动目标航向 —— 用【滤波后】的误差累加到 yaw_ref */
                 if (err_valid &&
-                    ((err_x < -AIM_DEADBAND_PX) || (err_x > AIM_DEADBAND_PX))) {
-                    yaw_ref += AIM_GAIN_RATE * err_x * SEND_PERIOD_SEC;
+                    ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX))) {
+                    yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
                 }
 #endif
                 if (!aim_step(yaw_ref, yaw_total, yaw_rate_lpf, rate_ok,
@@ -512,7 +602,8 @@ int main(void)
          *   G  陀螺帧数    —— 不涨 = 陀螺没发 / UART2 接线错
          *   M  云台反馈数  —— 不涨 = CAN 没通 / 云台没使能
          *   BO Bus-Off 次数—— 不为 0 = CAN 接线、终端电阻、或收发器 TX/RX 接反
-         *   E  当前 err_x (像素)
+         *   E  当前 err_x (像素, 原始)     Ef 滤波后 —— 控制用的是 Ef
+         *      两者对比就能看出卡尔曼压掉了多少抖动
          *   R  当前偏航角速度 (°/s) —— ⚠️ 打印的是 ×10 的值 (R=35 表示 3.5°/s)
          *   |R| 本周期平均 |角速度|, 同样 ×10
          *   P/D 当前烧进去的 YAW_KP(×10) / YAW_KD(×100) —— 确认板子跑的是哪版
@@ -523,7 +614,7 @@ int main(void)
          */
         if (++dbg_tick >= DEBUG_PERIOD_TICKS) {
             dbg_tick = 0;
-            printf("P=%d D=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld R=%ld |R|=%ld | Y=%ld e=%ld\r\n",
+            printf("P=%d D=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld Ef=%ld R=%ld |R|=%ld | Y=%ld e=%ld\r\n",
                    (int) (YAW_KP * 10.0f),            /* 角度环 P ×10 */
                    (int) (YAW_KD * 100.0f),           /* 阻尼系数 ×100 */
                    (unsigned long) vcount,
@@ -536,6 +627,7 @@ int main(void)
                    (unsigned long) g_gimbal_rx_err,
                    (unsigned long) g_gimbal_rx_bytes,
                    (long) err_x,
+                   (long) err_x_f,                              /* Ef: 滤波后 (控制用) */
                    (long) (yaw_rate * 10.0f),                   /* R: °/s ×10 */
                    (long) (((rabs_cnt > 0u) ? (rabs_sum / (float) rabs_cnt) : 0.0f) * 10.0f),
                    (long) (yaw_total / DEG2RAD),                /* Y: 连续航向 (°) */
