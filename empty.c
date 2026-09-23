@@ -40,21 +40,21 @@
  *
  * 控制结构
  * ---------------------------------------------------------------------------
- *   云台内部自带角度环, 所以主控只做**外环**, 增量式:
+ *   云台内部自带角度环, 主控在外面再套一层【航向环】, 增量式发指令:
  *
- *       Δθ = 视觉项 + 速率项
- *          = AIM_GAIN_RATE × err_x × dt  −  GYRO_RATE_K × ω_gimbal × dt
+ *       目标航向 yaw_ref ──→ 角度环 PI ──→ 目标角速度 w ──阻尼──→ Δθ
+ *                              ↑ 反馈 = IMU 连续航向 yaw_total
  *
- *   视觉项 (慢, 绝对基准):  dθ/dt = K·f·(θ_ref − θ), 一阶收敛不过冲。
- *       每拍收敛比例 λ = K·f·T, 特征方程 z² − z + λ = 0:
- *       λ<0.25 无振荡 / λ∈(0.25,1) 有振铃。
+ *   目标航向 (慢):  由视觉 err_x 累加而来 —— 决定"该朝哪看"。
  *
- *   速率项 (快, 抗扰动):  陀螺在云台上, 测到的就是云台角速度 ω_gimbal。
- *       按增益 K 反馈构成速率环, 车体转动当场被按住, 不必等视觉发现偏差。
- *       没它时斜坡输入的稳态跟随误差 = ω·τ, 弯道上超过 5cm 指标。
+ *   角度环 (快):    把 yaw_total 拉到 yaw_ref, 带积分消掉稳态误差。
+ *       ⚠️ 为什么不用纯速率环: 它要让 ω=0, 带宽必须高, 而 100 Hz 陀螺 +
+ *          10 ms 延迟撑不住 —— 实测 K=0.15 就震。角度环只需"守住方向",
+ *          带宽要求低得多, 这个延迟可以容忍。
  *
- *   ⚠️ 速率环增益有硬上限 (K < 1.0), 由陀螺数据率决定 —— 性能天花板。
- *      推导见 docs/云台自稳与速率环.md
+ *   阻尼:           陀螺角速度乘一个小系数抑制振铃。大了会自激。
+ *
+ *   详见 docs/云台自稳与速率环.md
  * ---------------------------------------------------------------------------
  */
 
@@ -188,73 +188,103 @@
 #define AIM_MAX_RATE_RAD_S      1.67f
 
 /* ==========================================================================
- * 陀螺速率环
+ * 航向环 (IMU 角度闭环) —— 参考江南大学方案
  * ---------------------------------------------------------------------------
- * 陀螺装在云台上, 测到的是云台自身的角速度, 按增益反馈回去抵抗扰动。
- * (这项以前叫"前馈" —— 叫错了, 它其实是反馈、是闭环。)
+ * 江南: 角度PID(反馈=IMU角度) -> 速度PID(反馈=IMU角速度) -> 力矩
+ * 我们电机内部自带角度环, 所以等价成: 角度环 PI + 阻尼 -> Δθ
  *
- * ⚠️ GYRO_RATE_K 必须 < 1.0: 增益 1.0 + 10 ms 延迟(陀螺 100 Hz) 会临界自激,
- *    频率约 50 Hz —— 就是那个剧烈震荡。推导见 docs/云台自稳与速率环.md
+ * ⚠️ 为什么扔掉纯速率环: 它要让 ω=0, 带宽必须高, 100 Hz 陀螺 + 10 ms 延迟
+ *    撑不住 —— 实测 K=0.15 就震。角度环只需"守住方向", 延迟不致命。
+ *    详见 docs/云台自稳与速率环.md
  * ========================================================================== */
 
-/* 轴。Z 轴朝上 -> 2 */
+/* 陀螺轴。Z 轴朝上 -> 2 */
 #define GYRO_RATE_AXIS      2u
 
-/* 环路增益, 必须 < 1.0。调大压低视觉环增益, 追靶迟钝就补 AIM_GAIN_RATE。
- *
- * ⚠️ 实测记录 (2026-09-23):
- *      K=0.3  震 / K=0  不震  → 确认是速率环
- *      但 K<1 理论上该稳, 实际 0.3 就震 → 有效环路增益比理论大 (plant 增益 ≠ 1)
- *      正在二分找稳定上限。 */
-#define GYRO_RATE_K         0.15f
+/* 角度环 P, 单位 1/s。Kp=4 -> 时间常数 250 ms (远大于 10 ms 延迟, 安全) */
+#define YAW_KP              18.0f
 
-/* 符号。反了会"车一转云台就朝同方向猛甩"。验证: 手转车身, 云台应反向补偿。 */
+/* 角度环 I, 单位 1/s²。消掉"车匀速转"时的稳态误差 —— 江南 Ki=0.8 同理 */
+#define YAW_KI              0.0f
+
+/* 积分限幅, rad/s */
+#define YAW_I_LIMIT         0.2f
+
+/* 阻尼系数 (原来的 GYRO_RATE_K)。只做阻尼, 别大。
+ * ⚠️ 实测: 纯速率环时 0.3 震 / 0.15 轻微震 / 0 不震 */
+#define YAW_KD              0.05f
+
+/* 陀螺速率项的符号 (阻尼用)。反了会"车一转云台就朝同方向猛甩" */
 #define GYRO_RATE_SIGN      (-1.0f)
 
-/* 一阶低通, 每陀螺帧一次。1.0 = 关闭。
- * ⚠️ 先关着! α=0.8(≈26Hz) 在 50 Hz 处引入 63° 相位滞后 —— 而本环路的
- *    病根就是滞后, 开滤波等于把 GYRO_RATE_K 降下来的收益吃回去。
- *    等 K 调到稳定之后, 若噪声确实碍事, 再从这个值往 1.0 方向小步试。 */
+/* ⚠️ 模块的 Yaw 与它自己的 GyroZ 【符号相反】—— 2026-09-23 实测:
+ *        手转云台时 gZ 持续为正, 而 yaw100 持续下跌。
+ *    我们的控制律要求两者同向, 所以累加时翻一下。
+ *    不翻的话角度环会变成【正反馈】-> 云台一直转、回不到目标。
+ *    ⚠️ 副作用: 调试行的 Y 显示的是翻转后的值, 和模块原始 Yaw 差个正负号。 */
+#define YAW_SIGN            (-1.0f)
+
+/* 阶段开关: 1 = 只测自稳(yaw_ref 固定, 不接视觉) / 0 = 接视觉
+ * 先跑 1, 确认"手转车身云台能守住方向", 再改 0 */
+#define YAW_HOLD_ONLY       0
+
+/* 一阶低通, 每陀螺帧一次。1.0 = 关闭 (滤波会加滞后, 先别开) */
 #define GYRO_LPF_ALPHA      1.0f
 
 /* ==========================================================================
  * 外环
  * ========================================================================== */
 
+/* 角度环的积分状态 */
+static float g_yaw_i = 0.0f;
+
 /* 算并发出这一步转角。
- *   err_valid / err_x_px : 视觉项输入 (err_valid=false 时视觉项按 0 处理)
- *   yaw_rate_dps         : 云台偏航角速度, °/s (【已滤波】, 见 GYRO_LPF_ALPHA)
- *   rate_valid           : 陀螺数据是否有效 (掉线时置 false, 免得用陈旧值猛补)
- * 返回 false 表示这一步没有任何分量, 没发。 */
-static bool aim_step(bool err_valid, float err_x_px,
-                     bool rate_valid, float yaw_rate_dps)
+ *
+ * 陀螺有效时走【航向环】: 角度环(PI) 把 yaw_total 拉到 yaw_ref, 再用陀螺
+ * 角速度做阻尼。陀螺掉线时退回【纯视觉】直接发增量 —— 因为 yaw_total 会
+ * 冻住, 继续用角度环等于拿陈旧值硬顶。
+ *
+ *   yaw_ref_rad   : 目标航向 (rad, 连续)
+ *   yaw_total_rad : IMU 连续航向 (rad)
+ *   yaw_rate_dps  : 云台偏航角速度 (°/s)
+ *   gyro_ok       : 陀螺数据是否有效
+ *   err_valid / err_x_px : 兜底用的视觉误差
+ * 返回 false 表示这一拍没发。 */
+static bool aim_step(float yaw_ref_rad, float yaw_total_rad,
+                     float yaw_rate_dps, bool gyro_ok,
+                     bool err_valid, float err_x_px)
 {
-    const float max_step = AIM_MAX_RATE_RAD_S * SEND_PERIOD_SEC;
-    float       dtheta   = 0.0f;
+    float dtheta;
 
-    /* --- 视觉项: 慢, 负责绝对基准 --- */
-    if (err_valid &&
-        ((err_x_px < -AIM_DEADBAND_PX) || (err_x_px > AIM_DEADBAND_PX))) {
-        dtheta += AIM_GAIN_RATE * err_x_px * SEND_PERIOD_SEC;
-    }
+    if (!gyro_ok) {
+        /* --- 兜底: 纯视觉 --- */
+        g_yaw_i = 0.0f;         /* 积分清零, 免得陀螺恢复时甩一下 */
+        if (!err_valid ||
+            ((err_x_px >= -AIM_DEADBAND_PX) && (err_x_px <= AIM_DEADBAND_PX))) {
+            return false;
+        }
+        dtheta = AIM_GAIN_RATE * err_x_px * SEND_PERIOD_SEC;
+    } else {
+        /* --- 航向环: 角度 PI + 速度阻尼 --- */
+        float e = yaw_ref_rad - yaw_total_rad;   /* 两边都连续, 不用回绕处理 */
+        float w = YAW_KP * e + g_yaw_i;          /* 目标角速度, rad/s */
+        w += GYRO_RATE_SIGN * YAW_KD * (yaw_rate_dps * DEG2RAD);
 
-    /* --- 速率项: 快, 抵抗扰动 ---
-     * 不受死区约束, 也不受"是否看到靶"约束 —— 丢靶时云台照样该稳住自己,
-     * 这正是"自稳"的含义。 */
-    /* ⚠️ 增益必须 < 1.0, 否则临界/发散 —— 推导见 GYRO_RATE_K 那一段 */
-    if (rate_valid) {
-        dtheta += GYRO_RATE_SIGN * GYRO_RATE_K *
-                  (yaw_rate_dps * DEG2RAD) * SEND_PERIOD_SEC;
-    }
+        if (w > AIM_MAX_RATE_RAD_S) {
+            w = AIM_MAX_RATE_RAD_S;
+        } else if (w < -AIM_MAX_RATE_RAD_S) {
+            w = -AIM_MAX_RATE_RAD_S;
+        }
 
-    if (dtheta == 0.0f) {
-        return false;               /* 两项都是 0, 没必要发 */
-    }
+        /* 积分放在限幅【之后】, 免得饱和期间继续累积 */
+        g_yaw_i += YAW_KI * e * SEND_PERIOD_SEC;
+        if (g_yaw_i > YAW_I_LIMIT) {
+            g_yaw_i = YAW_I_LIMIT;
+        } else if (g_yaw_i < -YAW_I_LIMIT) {
+            g_yaw_i = -YAW_I_LIMIT;
+        }
 
-    if (dtheta > max_step) {
-        dtheta = max_step;
-    } else if (dtheta < -max_step) {
-        dtheta = -max_step;
+        dtheta = w * SEND_PERIOD_SEC;
     }
 
     return gimbal_step_rad(dtheta);
@@ -301,6 +331,10 @@ int main(void)
     bool     err_valid = false;
     float    yaw_rate  = 0.0f;  /* °/s */
     float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
+    float    yaw_total  = 0.0f;   /* IMU 连续航向 (rad), 由回绕累加得到 */
+    float    yaw_prev   = 0.0f;   /* 上一帧原始航向 (deg), 算回绕用 */
+    bool     yaw_inited = false;  /* 首帧只记基准, 不累加 */
+    float    yaw_ref    = 0.0f;   /* 目标航向 (rad)。阶段1固定 0 = 锁定开机朝向 */
     bool     need_send = false; /* 本拍收到了新视觉帧 -> 立刻发, 不等定时 */
     uint8_t  gim_step  = GIM_STEP_IDLE;  /* 云台初始化序列的推进状态 */
 
@@ -366,6 +400,25 @@ int main(void)
              * 陀螺 100 Hz、主循环 1 kHz, 按拍跑的话同一个值会被反复滤波,
              * 等效截止频率直接变成 10 倍。 */
             yaw_rate_lpf += GYRO_LPF_ALPHA * (yaw_rate - yaw_rate_lpf);
+
+            /* --- 航向连续化: 模块给 0~360 回绕, 累加成连续角 ---
+             * 用【差分累加】而不是直接取绝对值, 这样偶尔漏一帧也不丢信息。 */
+            {
+                float now = gmsg.yaw_deg;
+                if (!yaw_inited) {
+                    yaw_prev   = now;      /* 首帧只记基准, yaw_total 从 0 起算 */
+                    yaw_inited = true;
+                } else {
+                    float d = now - yaw_prev;
+                    if (d > 180.0f) {
+                        d -= 360.0f;       /* 359° -> 1° 是前进, 不是倒退 358° */
+                    } else if (d < -180.0f) {
+                        d += 360.0f;
+                    }
+                    yaw_total += YAW_SIGN * d * DEG2RAD;
+                    yaw_prev   = now;
+                }
+            }
 #if DEBUG_PRINT_ENABLE
             /* 累加 |角速度|, 报告时给出本周期平均值 —— 标定 GYRO_LSB_PER_DPS 要用。
              * 取绝对值是因为手动转的时候正负都有, 要看的是"转得多快"。 */
@@ -435,8 +488,16 @@ int main(void)
                 /* 陀螺掉线时把速率项置无效, 别拿陈旧角速度继续猛补 */
                 bool rate_ok = (gyro_lost < GYRO_LOST_TICKS);
 
-                if (!aim_step(err_valid, err_x, rate_ok, yaw_rate_lpf)) {
-                    /* 视觉在死区内 + 车没转 —— 发 NOP 保活, 反馈才不会断
+#if !YAW_HOLD_ONLY
+                /* 阶段 2: 视觉驱动目标航向 —— err_x 累加到 yaw_ref 上 */
+                if (err_valid &&
+                    ((err_x < -AIM_DEADBAND_PX) || (err_x > AIM_DEADBAND_PX))) {
+                    yaw_ref += AIM_GAIN_RATE * err_x * SEND_PERIOD_SEC;
+                }
+#endif
+                if (!aim_step(yaw_ref, yaw_total, yaw_rate_lpf, rate_ok,
+                              err_valid, err_x)) {
+                    /* 没发出任何分量 —— 发 NOP 保活, 反馈才不会断
                      * (指令 0x00 就是"不改变任何东西, 只为索取反馈报文")。 */
                     gimbal_send_cmd(GIMBAL_CMD_NOP, 0);
                 }
@@ -452,15 +513,19 @@ int main(void)
          *   M  云台反馈数  —— 不涨 = CAN 没通 / 云台没使能
          *   BO Bus-Off 次数—— 不为 0 = CAN 接线、终端电阻、或收发器 TX/RX 接反
          *   E  当前 err_x (像素)
-         *   R  当前偏航角速度 (°/s)  —— 调 GYRO_RATE_K 就看这个
-         *   K/A 当前烧进去的 GYRO_RATE_K / GYRO_LPF_ALPHA (×100)。
-         *       有它才能确认板子上跑的是哪一版参数。
+         *   R  当前偏航角速度 (°/s) —— ⚠️ 打印的是 ×10 的值 (R=35 表示 3.5°/s)
+         *   |R| 本周期平均 |角速度|, 同样 ×10
+         *   P/D 当前烧进去的 YAW_KP(×10) / YAW_KD(×100) —— 确认板子跑的是哪版
+         *
+         *   Y  连续航向 (°), 由陀螺 Yaw 回绕累加而来。手转车身它会跟着变,
+         *      云台自稳成功的话它【应该基本不动】。
+         *   e  角度误差 = yaw_ref − yaw_total (°)。自稳成功时 e 应收敛到 0 附近。
          */
         if (++dbg_tick >= DEBUG_PERIOD_TICKS) {
             dbg_tick = 0;
-            printf("K=%d A=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld R=%ld |R|=%ld\r\n",
-                   (int) (GYRO_RATE_K * 100.0f),      /* 当前烧进去的速率环增益 ×100 */
-                   (int) (GYRO_LPF_ALPHA * 100.0f),   /* 低通系数 ×100, 100 = 关闭 */
+            printf("P=%d D=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld R=%ld |R|=%ld | Y=%ld e=%ld\r\n",
+                   (int) (YAW_KP * 10.0f),            /* 角度环 P ×10 */
+                   (int) (YAW_KD * 100.0f),           /* 阻尼系数 ×100 */
                    (unsigned long) vcount,
                    (unsigned long) g_vision_bad_csum,
                    (unsigned long) g_vision_overrun,
@@ -471,8 +536,10 @@ int main(void)
                    (unsigned long) g_gimbal_rx_err,
                    (unsigned long) g_gimbal_rx_bytes,
                    (long) err_x,
-                   (long) yaw_rate,
-                   (long) ((rabs_cnt > 0u) ? (rabs_sum / (float) rabs_cnt) : 0.0f));
+                   (long) (yaw_rate * 10.0f),                   /* R: °/s ×10 */
+                   (long) (((rabs_cnt > 0u) ? (rabs_sum / (float) rabs_cnt) : 0.0f) * 10.0f),
+                   (long) (yaw_total / DEG2RAD),                /* Y: 连续航向 (°) */
+                   (long) ((yaw_ref - yaw_total) / DEG2RAD));   /* e: 角度误差 (°) */
             vis_gap_max = 0;        /* 每个报告周期重新统计 */
             rabs_sum = 0.0f;
             rabs_cnt = 0;
