@@ -221,7 +221,7 @@ void gyro_link_init(void)
     /* SysConfig 只生成外设级中断使能, NVIC 这一层要自己开 */
     NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
 
-    /* 必须先切全数据模式: 前馈要的是 GyroZ 原始角速度, 仅姿态模式给不了 */
+    /* 必须先切全数据模式: 速率环要的是 GyroZ 原始角速度, 仅姿态模式给不了 */
     gyro_link_send_cmd(GYRO_CMD_SET_MODE, &mode_full, 1u);
     gyro_link_send_cmd(GYRO_CMD_REPORT_CTRL, &rep_on, 1u);
 }

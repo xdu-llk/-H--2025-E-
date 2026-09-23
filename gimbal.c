@@ -10,13 +10,9 @@
 
 #define GIMBAL_CRC_POLY      0x07u
 
+
 /* 等反馈的超时, 单位是 gimbal_poll() 的调用次数 (主循环 1 ms 一次)。
- * 115200 下一来一回约 1.4 ms, 4 ms 有约 2.8 倍余量。
- *
- * ⚠️ 必须**小于发送周期(5 ms)** —— 否则电机不响应时, 每次发送都要干等整个
- *    超时, 200 Hz 的节拍会被拖回 100 Hz, 平滑的意图就落空了。
- *    若上板后 TO 一直涨, 说明电机的实际响应比预期慢, 那时再权衡这个值。 */
-/* 等反馈的超时, 单位是 gimbal_poll() 的调用次数 (主循环 1 ms 一次)。
+ *  115200 下一来一回约 1.4 ms
  *
  * ⚠️ 设成**和发送周期一样长** (见 empty.c 的 SEND_PERIOD_TICKS), 让等待窗口
  *    覆盖整个周期。这样几乎永远处于"等待中", 任何到达的字节都会被攒起来。
@@ -26,7 +22,7 @@
  * 帧就永远攒不齐 (表现为 g_gimbal_rx_bytes 在涨、而 M 和 ME 都是 0)。
  *
  * ⚠️ 不能大于发送周期, 否则发不出下一条。改 SEND_PERIOD_TICKS 时这里要跟着改。 */
-#define GIMBAL_RX_TIMEOUT_TICKS  5u
+#define GIMBAL_RX_TIMEOUT_TICKS  5u //现在是5ms和发送周期一致
 
 /* TX FIFO 满时的自旋上限, 防止 UART 时钟异常把主循环卡死 */
 #define GIMBAL_TX_GUARD      200000u
@@ -42,11 +38,11 @@ static volatile uint8_t        s_rxlen = 0u;
 static volatile uint16_t       s_wait_ticks = 0u;
 
 /* 只有 ISR 会碰 */
-static uint8_t s_rxbuf[GIMBAL_RX_LEN];
+static uint8_t s_rxbuf[GIMBAL_RX_LEN];//中断接收缓冲区, 由 ISR 写, gimbal_parse() 读
 
 /* ISR 写, 任务上下文经 gimbal_get_feedback() 读 */
-static volatile gimbal_feedback_t s_fb;
-static volatile bool              s_fb_ready;
+static volatile gimbal_feedback_t s_fb;//电机反馈信息的结构体
+static volatile bool              s_fb_ready;//主循环看到置true就拷贝 s_fb, 并置 false
 
 volatile uint32_t g_gimbal_rx_count = 0u;
 volatile uint32_t g_gimbal_tx_fail  = 0u;
@@ -54,15 +50,15 @@ volatile uint32_t g_gimbal_timeout  = 0u;
 volatile uint32_t g_gimbal_rx_err   = 0u;
 volatile uint32_t g_gimbal_rx_bytes = 0u;
 
-volatile uint8_t  g_gimbal_snoop[GIMBAL_SNOOP_LEN];
+volatile uint8_t  g_gimbal_snoop[GIMBAL_SNOOP_LEN];//环形缓冲区
 volatile uint8_t  g_gimbal_snoop_pos = 0u;
 
 /* 每收到一个字节 (无论用不用得上) 都存进环里 */
-static void gimbal_snoop_put(uint8_t byte)
+static void gimbal_snoop_put(uint8_t byte)//环形缓冲区写入函数
 {
     g_gimbal_snoop[g_gimbal_snoop_pos] = byte;
     g_gimbal_snoop_pos = (uint8_t)((g_gimbal_snoop_pos + 1u) % GIMBAL_SNOOP_LEN);
-}
+}//当g_gimbal_snoop_pos达到GIMBAL_SNOOP_LEN时,会回到0,实现环形缓冲区的循环写入
 
 /* ==========================================================================
  * CRC8
@@ -87,7 +83,7 @@ static uint8_t gimbal_crc8(const uint8_t *data, uint8_t len)
         }
     }
 
-    return crc;
+    return crc;//返回计算得到的CRC8校验码
 }
 
 /* ==========================================================================
@@ -128,7 +124,7 @@ static void gimbal_parse(void)
  * 发送
  * ========================================================================== */
 
-bool gimbal_send_cmd(uint8_t cmd, int16_t value)
+bool gimbal_send_cmd(uint8_t cmd, int16_t value)//cmd命令模式，后面为要发的值
 {
     uint8_t buf[GIMBAL_TX_LEN];
     uint8_t i;
@@ -141,7 +137,7 @@ bool gimbal_send_cmd(uint8_t cmd, int16_t value)
 
     buf[0] = GIMBAL_ID;
     buf[1] = cmd;
-    buf[2] = (uint8_t) ((uint16_t) value & 0xFFu);
+    buf[2] = (uint8_t) ((uint16_t) value & 0xFFu);//小端模式，低字节放低地址
     buf[3] = (uint8_t) (((uint16_t) value >> 8) & 0xFFu);
     buf[4] = gimbal_crc8(buf, GIMBAL_TX_LEN - 1u);
 
@@ -202,12 +198,12 @@ bool gimbal_disable(void)
     return gimbal_send_cmd(GIMBAL_CMD_DISABLE, 0);
 }
 
-bool gimbal_set_zero(void)
+bool gimbal_set_zero(void)//设置零点
 {
     return gimbal_send_cmd(GIMBAL_CMD_SET_ZERO, 0);
 }
 
-bool gimbal_clear_error(void)
+bool gimbal_clear_error(void)//清除错误码
 {
     return gimbal_send_cmd(GIMBAL_CMD_CLEAR_ERROR, 0);
 }
@@ -222,7 +218,7 @@ void gimbal_init(void)
     NVIC_EnableIRQ(UART_1_INST_INT_IRQN);
 }
 
-void gimbal_poll(void)
+void gimbal_poll(void)//等待超时计数器
 {
     if (s_state == GS_WAITING) {
         if (++s_wait_ticks >= GIMBAL_RX_TIMEOUT_TICKS) {
@@ -235,7 +231,7 @@ void gimbal_poll(void)
 
 bool gimbal_get_feedback(gimbal_feedback_t *out)
 {
-    uint32_t primask;
+    uint32_t primask;//保存中断状态
     bool     ok = false;
 
     if (out == NULL) {
@@ -243,14 +239,14 @@ bool gimbal_get_feedback(gimbal_feedback_t *out)
     }
 
     /* 关中断拷贝, 防止 6 个字段被 ISR 在中间改掉 */
-    primask = __get_PRIMASK();
-    __disable_irq();
+    primask = __get_PRIMASK();//获取当前中断状态
+    __disable_irq();//关闭中断
     if (s_fb_ready) {
         *out       = *(const gimbal_feedback_t *) &s_fb;
         s_fb_ready = false;
         ok         = true;
     }
-    __set_PRIMASK(primask);
+    __set_PRIMASK(primask);//恢复中断状态
 
     return ok;
 }
