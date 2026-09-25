@@ -215,6 +215,27 @@
 #define KF_RESET_TICKS  200u
 
 /* ==========================================================================
+ * 找靶 (视觉在线, 但没识别到靶纸时)
+ * ---------------------------------------------------------------------------
+ * 丢靶后不干等 —— 记住【最后一次有效 err_x 的方向】, 以固定速率慢推 yaw_ref,
+ * 把云台扫回去。航向环照常工作, 所以扫描期间自稳不受影响。
+ *
+ * ⚠️ 本质只是"人为地推 yaw_ref", 和视觉推是同一个机制, 不新增一层控制。
+ * ⚠️ 单向扫。若靶纸在身后(超过扫过的角度)就找不回来 —— 那要升级成往返扫。
+ * ========================================================================== */
+
+/* 扫描速率, rad/s ≈ 46°/s。
+ * 依据: 曝光 5 ms 时运动模糊 = rate × 0.005 rad, 46°/s 下只有 0.22° ≈ 1 px, 可接受 */
+#define SEARCH_RATE         0.80f
+
+/* 丢靶前误差小于这个就不搜 —— 靶纸就在附近(比如被人遮挡), 乱搜反而跑远 */
+#define SEARCH_MIN_ERR_PX   5.0f
+
+/* 最多推这么多拍。累加块每 5 ms 跑一次 -> 800 拍 = 4 秒
+ * 扫过的角度 = SEARCH_RATE × 4 s = 3.2 rad ≈ 183° */
+#define SEARCH_MAX_TICKS    800u
+
+/* ==========================================================================
  * 航向环 (IMU 角度闭环) —— 参考江南大学方案
  * ---------------------------------------------------------------------------
  * 江南: 角度PID(反馈=IMU角度) -> 速度PID(反馈=IMU角速度) -> 力矩
@@ -410,6 +431,10 @@ int main(void)
     float    err_x_f   = 0.0f;   /* 卡尔曼滤波后的误差 —— 控制用这个 */
     uint16_t tgt_lost  = 0;      /* 连续丢靶的帧数, 用来决定何时复位滤波器 */
     bool     err_valid = false;
+
+    /* --- 找靶 --- */
+    float    last_err_x  = 0.0f; /* 最后一次有效 err_x —— 丢靶后往哪边找 */
+    uint16_t search_tick = 0;    /* 找靶已经推了多少拍 */
     float    yaw_rate  = 0.0f;  /* °/s */
     float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
     float    yaw_total  = 0.0f;   /* IMU 连续航向 (rad), 由回绕累加得到 */
@@ -585,9 +610,21 @@ int main(void)
 
 #if !YAW_HOLD_ONLY
                 /* 阶段 2: 视觉驱动目标航向 —— 用【滤波后】的误差累加到 yaw_ref */
-                if (err_valid &&
-                    ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX))) {
-                    yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
+                if (err_valid) {
+                    /* --- 正常闭环 --- */
+                    last_err_x  = err_x_f;      /* 记住方向, 丢靶后要用 */
+                    search_tick = 0;
+                    if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {
+                        yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
+                    }
+                } else if ((vis_lost < VISION_LOST_TICKS) &&          /* 视觉还在线 */
+                           (search_tick < SEARCH_MAX_TICKS) &&        /* 还没超时 */
+                           ((last_err_x >  SEARCH_MIN_ERR_PX) ||      /* 且丢靶前误差 */
+                            (last_err_x < -SEARCH_MIN_ERR_PX))) {     /* 足够大 */
+                    /* --- 找靶: 按最后已知方向慢推 yaw_ref --- */
+                    float dir = (last_err_x > 0.0f) ? 1.0f : -1.0f;
+                    yaw_ref += dir * SEARCH_RATE * SEND_PERIOD_SEC;
+                    search_tick++;
                 }
 #endif
                 if (!aim_step(yaw_ref, yaw_total, yaw_rate_lpf, rate_ok,
