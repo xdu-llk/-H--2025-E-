@@ -453,7 +453,9 @@ def init_uart():
 DIGIT_MODEL_PATH_LOCAL = "model_320576.mud"
 DIGIT_MODEL_PATH_SYS = "/root/models/maixhub/320576/model_320576.mud"
 
-# --- 识别阶段 ---
+# --- 数字识别：瞄准循环里的【并行任务】，不再是独立阶段 ---
+# 流程: 瞄准稳定 -> 开数字识别 -> 认出 -> 发底盘 -> 关掉数字模型
+#       ⚠️ 全程【不切摄像头分辨率】
 DIGIT_CAM_W = 416           # 模型输入就是 416x416，必须正方形
 DIGIT_CAM_H = 416
 # 置信度阈值。MaixHub 示例用 0.5；放宽到 0.4 能多检出一些，误检交给下面的
@@ -463,10 +465,23 @@ DIGIT_IOU_TH = 0.45
 # 连续多少帧都是同一个数字才认。单帧准确率只有 93.2%（模型报告里 val_acc），
 # 连 5 帧能把误判压到千分之几。
 DIGIT_CONFIRM_N = 5
-# 认不出来就跑这么久然后放弃（给底盘发 0，让它知道没认出来）
-DIGIT_MAX_SECONDS = 20.0
-# 确认后往底盘重复发多久。**不需要反向 ACK** —— 发几十遍总有一遍能到，
-# 这样两边都只做单向，链路最少。
+
+# ⚠️ 模型要 416x416，而瞄准画面是 416x260 —— 居中裁 260x260 再缩放（方案 B）
+DIGIT_CROP_N = 260
+
+# ⚠️ 每 N 帧才跑一次数字推理。
+#    两个模型同时跑会掉帧率，而【认不出时要一直认】(车必须拿到数字才能停车)，
+#    所以必须降频，不能每帧跑。
+#    代价: 认出所需时间 = DIGIT_EVERY_N × DIGIT_CONFIRM_N 个瞄准帧。
+DIGIT_EVERY_N = 3
+
+# --- 什么时候开启数字识别 ---
+# 云台瞄准稳定后才开: 连续这么多帧 |err_x| 都在阈值内。
+# 阈值比主控那边的死区(2px)宽松一些, 容易达到。
+DIGIT_TRIGGER_PX = 5.0
+DIGIT_TRIGGER_N  = 10
+
+# 往底盘重复发数字多久(秒)。发几十遍总有一遍能到。
 DIGIT_REPEAT_SECONDS = 3.0
 DIGIT_SEND_HZ = 20.0
 
@@ -480,7 +495,8 @@ CHASSIS_UART_RX_PIN = "A31"             # UART1_RX <- 接底盘的 TX（只发�
 CHASSIS_UART_BAUDRATE = 115200
 
 DIGIT_FRAME_HEADER = b"\xAA\x55"
-DIGIT_FRAME_CMD = 0x4E                  # 'N'
+DIGIT_FRAME_CMD = 0x4E                  # 'N' —— 我们发给底盘的数字帧
+DIGIT_ACK_CMD   = 0x41                  # 'A' —— 底盘收到后回这个(回显同一个 digit)
 
 
 def build_digit_frame(digit):
@@ -529,92 +545,139 @@ def init_uart_chassis():
         return None
 
 
-def _send_digit(dev, digit):
-    """往底盘重复发数字，持续 DIGIT_REPEAT_SECONDS 秒。"""
+# ACK 可用性。一旦发现这个 MaixPy 的 UART 不支持读，就永久关掉，不再重试。
+_ACK_AVAILABLE = True
+
+
+def _wait_chassis_ack(dev, digit, timeout_s):
+    """在 timeout_s 内等底盘回的 ACK。收到返回 True。
+
+    ACK 格式: AA 55 'A' <digit> <checksum>  —— 底盘回显它收到的数字。
+
+    ⚠️ MaixPy 的 UART 没有 any()，读取只有 read(len, timeout)：
+           read()                   = read(-1, 0)，有数据立刻返回，没有返回 b''
+       所以这里用 read(len=-1, timeout=5) —— 最多阻塞 5ms，有数据马上返回。
+       一次轮询最多花 5ms，在 200ms 的发送周期里绰绰有余。
+    """
+    global _ACK_AVAILABLE
+    if not _ACK_AVAILABLE:
+        return False
+
+    t0 = pytime.time()
+    buf = b""
+    while pytime.time() - t0 < timeout_s:
+        try:
+            data = dev.read(len=-1, timeout=5)
+        except Exception as exc:
+            print("⚠️ 底盘串口读不了(%s)，关闭 ACK 等待" % exc)
+            _ACK_AVAILABLE = False
+            return False
+
+        if not data:
+            continue                    # 这一段没收到东西，接着轮询
+        buf += data
+
+        while len(buf) >= 5:
+            i = buf.find(DIGIT_FRAME_HEADER)
+            if i < 0:
+                buf = b""
+                break
+            if len(buf) - i < 5:
+                buf = buf[i:]
+                break
+            f = buf[i:i + 5]
+            buf = buf[i + 5:]
+            if (f[2] == DIGIT_ACK_CMD and f[3] == (digit & 0xFF)
+                    and (sum(f[:4]) & 0xFF) == f[4]):
+                return True
+    return False
+
+
+def send_digit(dev, digit):
+    """往底盘重复发数字。
+
+    收到 ACK 就提前结束；等不到也发够 DIGIT_REPEAT_SECONDS 就走，**不卡流程**。
+
+    ⚠️ 前向兼容：底盘即使还没实现 ACK，行为也和"只发不确认"完全一样。
+    """
     if dev is None:
         print("底盘串口不可用，数字没发出去:", digit)
-        return
+        return False
+
     frame = build_digit_frame(digit)
     n = max(1, int(DIGIT_REPEAT_SECONDS * DIGIT_SEND_HZ))
     period = 1.0 / DIGIT_SEND_HZ
-    print("向底盘发送 N=%d，共 %d 次" % (digit, n))
-    for _ in range(n):
+    print("向底盘发送 N=%d，最多 %d 次" % (digit, n))
+
+    for k in range(n):
         try:
             dev.write(frame)
         except Exception as exc:
             print("底盘串口发送失败:", exc)
-            return
-        pytime.sleep(period)
+            return False
+        if _wait_chassis_ack(dev, digit, period):
+            print("✅ 底盘已确认收到 N=%d（第 %d 次）" % (digit, k + 1))
+            return True
+
+    print("⚠️ 没等到底盘 ACK，已重复发 %d 次（底盘可能还没实现应答）" % n)
+    return False
 
 
-def run_digit_phase(cam, chassis_dev):
-    """认数字。返回 1~4；认不出来返回 0。
+def load_digit_model():
+    """加载数字模型。失败返回 None —— 数字识别整个跳过，不影响瞄准。
 
-    ⚠️ 标签陷阱：模型的 labels 是 ["3", "1", "2", "4"]，不是顺序的 1~4。
-       所以必须用 detector.labels[class_id] 反查字符串再转 int，
-       **绝不能写 class_id + 1** ——那会把 3 当成 1、4 当成 2，停错点位。
+    ⚠️ 在【开机时】调，别等瞄准稳定了再调：模型 7.6MB，加载要好几秒，
+       放在主循环里会把云台卡住。
     """
-    print("=== 阶段 1: 识别数字 ===")
-
-    if not _set_resolution(cam, DIGIT_CAM_W, DIGIT_CAM_H):
-        return 0
-
-    # 先试相对路径（模型跟应用打包在一起），不行再回退到系统目录
     model_path = DIGIT_MODEL_PATH_LOCAL
     if not os.path.exists(model_path):
         model_path = DIGIT_MODEL_PATH_SYS
-    print("数字模型:", model_path, "存在" if os.path.exists(model_path) else "不存在!")
-
+    if not os.path.exists(model_path):
+        print("!! 数字模型不存在，跳过数字识别:", model_path)
+        return None
     try:
         detector = nn.YOLOv5(model=model_path)
+        print("数字模型已加载:", model_path, "标签:", detector.labels)
+        return detector
     except Exception as exc:
-        print("!! 数字模型加载失败，跳过识别:", exc)
-        _set_resolution(cam, CAM_W, CAM_H)
+        print("!! 数字模型加载失败，跳过数字识别:", exc)
+        return None
+
+
+def crop_for_digit(frame_rgb):
+    """416x260 -> 居中裁 260x260 -> 缩放到 416x416（方案 B）。
+
+    ⚠️ 只看画面中间那块。数字牌在画面边缘会看不到 —— 但数字识别是在
+       【瞄准稳定后】才开的，那时靶纸已经在画面中心附近了。
+    """
+    h, w = frame_rgb.shape[:2]
+    s = min(h, w, DIGIT_CROP_N)
+    x0 = (w - s) // 2
+    y0 = (h - s) // 2
+    return cv2.resize(frame_rgb[y0:y0 + s, x0:x0 + s], (DIGIT_CAM_W, DIGIT_CAM_H))
+
+
+def detect_digit(detector, frame_rgb):
+    """在裁剪缩放后的图上跑一次 YOLO。返回 1~4；没检出/认不出返回 0。
+
+    ⚠️ 标签陷阱：模型的 labels 是 ["3", "1", "2", "4"]，不是顺序的 1~4。
+       所以必须用 detector.labels[class_id] 反查字符串再转 int，
+       **绝不能写 class_id + 1** —— 那会把 3 当成 1、4 当成 2，停错点位。
+    """
+    try:
+        objs = detector.detect(crop_for_digit(frame_rgb),
+                               conf_th=DIGIT_CONF_TH, iou_th=DIGIT_IOU_TH)
+    except Exception as exc:
+        print("!! 数字检测失败:", exc)
         return 0
-
-    print("模型标签:", detector.labels)
-
-    last_digit = 0
-    same_count = 0
-    result = 0
-    t_start = pytime.time()
-
-    while not app.need_exit():
-        if pytime.time() - t_start > DIGIT_MAX_SECONDS:
-            print("!! 超时，没认出数字")
-            break
-
-        img = cam.read()
-        try:
-            objs = detector.detect(img, conf_th=DIGIT_CONF_TH, iou_th=DIGIT_IOU_TH)
-        except Exception as exc:
-            print("!! 检测失败:", exc)
-            break
-
-        digit = 0
-        if len(objs) > 0:
-            best = max(objs, key=lambda o: o.score)   # 取置信度最高的那个
-            try:
-                digit = int(detector.labels[best.class_id])
-            except Exception:
-                digit = 0
-
-        if digit in (1, 2, 3, 4):
-            same_count = same_count + 1 if digit == last_digit else 1
-        else:
-            same_count = 0
-        last_digit = digit
-
-        if same_count >= DIGIT_CONFIRM_N:
-            result = digit
-            print("确认数字 N = %d（连续 %d 帧）" % (digit, same_count))
-            break
-
-    _send_digit(chassis_dev, result)
-
-    _set_resolution(cam, CAM_W, CAM_H)
-    print("=== 阶段 2: 矩形识别瞄准 ===")
-    return result
+    if len(objs) == 0:
+        return 0
+    best = max(objs, key=lambda o: o.score)      # 取置信度最高的那个
+    try:
+        d = int(detector.labels[best.class_id])
+    except Exception:
+        return 0
+    return d if d in (1, 2, 3, 4) else 0
 
 
 # =============================================================================
@@ -1561,14 +1624,28 @@ def init_camera():
     return cam
 
 
-def run_aim_loop(cam, disp, serial_dev):
-    """阶段 2：矩形识别 + 瞄准。原来的主循环，只把设备和串口改成参数传入。
+def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
+    """主循环：矩形识别 + 瞄准。数字识别作为【并行任务】嵌在里面。
 
-    cam / disp / serial_dev 都由调用方（main.py）建好传进来 —— 这样"认数字"
-    和"瞄准"两个阶段怎么衔接，就全摆在 main.py 里，一眼能看清整场流程。
+    cam / disp / serial_dev / chassis_dev 都由调用方（main.py）建好传进来。
 
-    进来时相机应该已经是 CAM_W x CAM_H（416x260）—— 数字阶段结束时切回来了。
+    ⚠️ 摄像头分辨率全程保持 CAM_W x CAM_H（416x260），**一次都不切** ——
+       数字识别是对画面做居中裁剪，不动相机设置。
+
+    数字识别流程:
+        ① 瞄准稳定（连续 DIGIT_TRIGGER_N 帧 |err_x| 在阈值内）
+        ② -> 开启数字识别（每 DIGIT_EVERY_N 帧跑一次，降频省 CPU）
+        ③ -> 认出（连续 DIGIT_CONFIRM_N 次）-> 发底盘 -> 关掉数字模型
+    ⚠️ 认不出要一直认（车必须拿到数字才能停车），所以必须降频，不能每帧跑。
     """
+    digit_model = load_digit_model()     # ★ 开机就加载, 别等瞄准稳定再加载(会卡几秒)
+    digit_on = (digit_model is not None) # 数字识别是否已开启
+    digit_done = False                   # 是否已经发过(发过就彻底关掉)
+    digit_ready = 0                      # 连续"瞄准好"的帧数
+    digit_last = 0                       # 上一次认出的数字
+    digit_same = 0                       # 连续相同次数
+    digit_skip = 0                       # 距上次推理过了几帧(降频用)
+
     ts = None
     if DEBUG_TOUCH:
         try:
@@ -1613,6 +1690,37 @@ def run_aim_loop(cam, disp, serial_dev):
             except Exception as exc:
                 print("串口发送失败:", exc)
                 serial_dev = None
+
+        # --- 数字识别：瞄准稳定后开启，认出后永久关闭 ---
+        # ⚠️ 这段和上面的瞄准完全独立 —— 无论它在不在跑，err_x 都照发。
+        if digit_model is not None and not digit_done:
+            if not digit_on:
+                # 阶段①：等瞄准稳定
+                if result["found"] and abs(result["err_x_px"]) < DIGIT_TRIGGER_PX:
+                    digit_ready += 1
+                else:
+                    digit_ready = 0
+                if digit_ready >= DIGIT_TRIGGER_N:
+                    digit_on = True
+                    print("✅ 瞄准稳定 -> 开启数字识别")
+            else:
+                # 阶段②：降频推理（认不出就一直认）
+                digit_skip += 1
+                if digit_skip >= DIGIT_EVERY_N:
+                    digit_skip = 0
+                    d = detect_digit(digit_model, frame_rgb)
+                    if d:
+                        digit_same = digit_same + 1 if d == digit_last else 1
+                    else:
+                        digit_same = 0
+                    digit_last = d
+
+                    if digit_same >= DIGIT_CONFIRM_N:
+                        print("✅ 确认数字 N = %d（连续 %d 次）" % (d, digit_same))
+                        send_digit(chassis_dev, d)
+                        digit_model = None       # ★ 关掉，后面不再跑
+                        digit_done = True
+                        print("数字模型已关闭，继续纯瞄准")
 
         # --- 触摸：右上角按钮 / 打点取样 ---
         if ts is not None:
@@ -1712,10 +1820,10 @@ def run_aim_loop(cam, disp, serial_dev):
 
 
 def run_find_rects():
-    """兼容旧入口：初始化 -> 认数字 -> 瞄准。
+    """兼容旧入口：初始化 -> 主循环。
 
-    整场流程现在摆在这里看得最清楚，也可以直接参考 main.py（那边是同样的
-    三步，只是拆开了）。
+    ⚠️ 不再是"先认数字再瞄准"两个阶段了 —— 数字识别现在是瞄准循环里的
+       并行任务（瞄准稳定后自动开，认出后自动关），摄像头全程不切分辨率。
     """
     cv2.setUseOptimized(True)
     cv2.setNumThreads(2)        # AX630C 双核，做视觉算法加速
@@ -1723,10 +1831,9 @@ def run_find_rects():
     cam = init_camera()
     disp = display.Display()
     serial_dev = init_uart()            # 发给云台主控（err_x）
-    chassis_dev = init_uart_chassis()   # 发给底盘（数字 N）
+    chassis_dev = init_uart_chassis()   # 发给底盘（数字 N，只在认出时用一次）
 
-    run_digit_phase(cam, chassis_dev)   # 阶段 1（整场只跑一次，内部会切分辨率）
-    run_aim_loop(cam, disp, serial_dev) # 阶段 2
+    run_aim_loop(cam, disp, serial_dev, chassis_dev)
 
 
 # =============================================================================
