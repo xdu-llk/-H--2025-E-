@@ -231,6 +231,15 @@
 /* 丢靶前误差小于这个就不搜 —— 靶纸就在附近(比如被人遮挡), 乱搜反而跑远 */
 #define SEARCH_MIN_ERR_PX   5.0f
 
+/* 连续丢这么多【帧】才启动搜索。
+ * ⚠️ 没它的话, 视觉单帧检测失败就立刻以 SEARCH_RATE(46°/s) 猛推 yaw_ref ——
+ *    而视觉环在 err_x=10px 时本来只该推 0.05 rad/s, 差十几倍。
+ *    于是: 检测一抖 -> 猛推 -> 冲过靶心 -> 反向再推 -> 停不下来。
+ * 取 10 的道理: 门槛没到时 yaw_ref 是冻住的, 航向环照常自稳 —— 等待期云台只是
+ *    原地保持指向, 不是空转。而真丢靶后光扫一圈就要 8s, 晚 200ms 起步无所谓。
+ *    代价单向偏小, 所以宁可取大。 */
+#define SEARCH_CONFIRM_FRAMES   10u
+
 /* 最多推这么多拍。累加块每 5 ms 跑一次 -> 1600 拍 = 8 秒
  * 扫过的角度 = SEARCH_RATE × 8 s = 6.4 rad ≈ 366°, 扫满一圈。
  * ⇒ 上电时不管停在哪个位置、靶纸在哪个方向, 一圈之内必能找到。
@@ -455,6 +464,7 @@ int main(void)
     float    last_err_x  = 0.0f; /* 最后一次有效 err_x —— 丢靶后往哪边找 */
     uint16_t search_tick = 0;    /* 找靶已经推了多少拍 */
     bool     ever_seen   = false;/* 曾经识别到过靶纸吗 —— 区分上电找靶/丢靶找靶 */
+    bool     searching   = false;/* 上一拍在搜索? 认回靶时要拉平 yaw_ref */
     float    yaw_rate  = 0.0f;  /* °/s */
     float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
     float    yaw_total  = 0.0f;   /* IMU 连续航向 (rad), 由回绕累加得到 */
@@ -635,11 +645,22 @@ int main(void)
                     ever_seen   = true;         /* 标记: 之后丢靶就按方向找 */
                     last_err_x  = err_x_f;      /* 记住方向, 丢靶后要用 */
                     search_tick = 0;
+                    /* 刚搜回来: 搜索期间 yaw_total 追不上 SEARCH_RATE 的扫描速度,
+                     * 一直落后 yaw_ref 约 SEARCH_RATE/YAW_KP = 0.1 rad。这份"超前量"
+                     * 留在 yaw_ref 里的话, 航向环会继续把云台往那个方向推 —— 就是
+                     * "冲过靶心再拉回"。拉平到云台实际位置即可, 剩下的误差交给
+                     * 视觉环按 err_x 积分去补。 */
+                    if (searching) {
+                        yaw_ref   = yaw_total;
+                        searching = false;
+                    }
                     if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {
                         yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
                     }
                 } else if ((vis_lost < VISION_LOST_TICKS) &&        /* 视觉还在线 */
+                           (tgt_lost >= SEARCH_CONFIRM_FRAMES) &&   /* 确认真丢了 */
                            (search_tick < SEARCH_MAX_TICKS)) {      /* 还没超时 */
+                    searching = true;
                     if (ever_seen &&
                         ((last_err_x >  SEARCH_MIN_ERR_PX) ||
                          (last_err_x < -SEARCH_MIN_ERR_PX))) {

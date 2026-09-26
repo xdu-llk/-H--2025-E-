@@ -225,7 +225,7 @@ THRESH_MODE = "fixed"
 #
 # ⚠️ 不要为了"让框闭合"去抬 T —— 抬 T 会让背景大量涌进来（这是反二值化，
 # 比 T 暗的算前景，T 越大进来的越多）。框断口应该交给 Canny 和闭运算补。
-FIXED_THRESHOLD = 95
+FIXED_THRESHOLD = 130
 
 # --- 初筛 ---
 # 最小轮廓面积(px^2)，416x260 下。
@@ -694,6 +694,9 @@ PROFILE_DATA = {
     # 帧率随场景波动很大（同一份参数能差好几倍），所以需要一个【跟场景无关】的
     # 指标来判断 MIN_AREA 到底挡掉了多少 —— 这两个数就是干这个的。
     "contours": 0, "cand": 0,
+    # digit = 数字模型单次推理耗时。它【不在】detect() 里 —— 数字识别是瞄准的
+    # 并行任务，只在跑 YOLO 的那些帧更新，是用来回答"开了数字模型掉多少帧"的。
+    "digit": 0.0,
 }
 
 
@@ -1708,7 +1711,9 @@ def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
                 digit_skip += 1
                 if digit_skip >= DIGIT_EVERY_N:
                     digit_skip = 0
+                    t_dig = pytime.perf_counter()
                     d = detect_digit(digit_model, frame_rgb)
+                    PROFILE_DATA["digit"] = (pytime.perf_counter() - t_dig) * 1000.0
                     if d:
                         digit_same = digit_same + 1 if d == digit_last else 1
                     else:
@@ -1796,8 +1801,8 @@ def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
         if PROFILE and frame_count % (PROFILE_EVERY * 10) == 0:
             print(
                 "[PROFILE] fps %.1f (周期 %.1fms) | detect %.1fms"
-                " = pre %.1f + find %.1f + h %.1f | 取流+绘制+show+串口 %.1fms"
-                "   [maix_time.fps()=%.1f]"
+                " = pre %.1f + find %.1f + h %.1f | 其余(取流+绘制+show+串口"
+                "，跑数字模型的那帧还含 YOLO) %.1fms   [maix_time.fps()=%.1f]"
                 % (
                     fps_real, loop_ms,
                     PROFILE_DATA["total"],
@@ -1806,6 +1811,13 @@ def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
                     fps_lib,
                 )
             )
+            if PROFILE_DATA["digit"] > 0.0:
+                print(
+                    "           数字模型 %.1fms/次，每 %d 帧跑 1 次"
+                    " -> 平均周期拉长约 %.1fms"
+                    % (PROFILE_DATA["digit"], DIGIT_EVERY_N,
+                       PROFILE_DATA["digit"] / DIGIT_EVERY_N)
+                )
             print(
                 "           find %.1fms 拆开 = 找轮廓 %.1f + 拟合四边形 %.1f"
                 " + 各道闸 %.1f | 轮廓 %d 个, 过门槛 %d 个"
