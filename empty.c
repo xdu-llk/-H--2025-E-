@@ -235,6 +235,11 @@
  * 扫过的角度 = SEARCH_RATE × 4 s = 3.2 rad ≈ 183° */
 #define SEARCH_MAX_TICKS    800u
 
+/* 上电扫描方向。+1 = 正向, -1 = 反向。
+ * ⚠️ 上电时不知道靶纸在哪, 也不知道云台停在限位的哪个位置 —— 所以固定往
+ *    一个方向扫, 撞限位就靠电机自己的过流保护 (我们收不到反馈, 检测不了)。 */
+#define BOOT_SEARCH_DIR     1.0f
+
 /* ==========================================================================
  * 航向环 (IMU 角度闭环) —— 参考江南大学方案
  * ---------------------------------------------------------------------------
@@ -348,22 +353,27 @@ static float g_yaw_i = 0.0f;
  *   yaw_total_rad : IMU 连续航向 (rad)
  *   yaw_rate_dps  : 云台偏航角速度 (°/s)
  *   gyro_ok       : 陀螺数据是否有效
- *   err_valid / err_x_px : 兜底用的视觉误差
+ *   err_valid / err_x_f : 兜底用的视觉误差 (滤波后)
  * 返回 false 表示这一拍没发。 */
 static bool aim_step(float yaw_ref_rad, float yaw_total_rad,
                      float yaw_rate_dps, bool gyro_ok,
-                     bool err_valid, float err_x_px)
+                     bool err_valid, float err_x_f)
 {
+    const float max_step = AIM_MAX_RATE_RAD_S * SEND_PERIOD_SEC;
     float dtheta;
 
     if (!gyro_ok) {
-        /* --- 兜底: 纯视觉 --- */
+        /* --- 兜底: 纯视觉 ---
+         * ⚠️ 陀螺掉线时 yaw_total 会【冻住】, 航向环的反馈就失效了 ——
+         *    再用它会变成"云台转了但误差不变" -> 一路转到限位。
+         *    所以摘掉航向环, 退回直接用视觉误差发增量。
+         *    (视觉这条信息没断, 所以至少还在追靶, 只是失去自稳) */
         g_yaw_i = 0.0f;         /* 积分清零, 免得陀螺恢复时甩一下 */
         if (!err_valid ||
-            ((err_x_px >= -AIM_DEADBAND_PX) && (err_x_px <= AIM_DEADBAND_PX))) {
+            ((err_x_f >= -AIM_DEADBAND_PX) && (err_x_f <= AIM_DEADBAND_PX))) {
             return false;
         }
-        dtheta = AIM_GAIN_RATE * err_x_px * SEND_PERIOD_SEC;
+        dtheta = AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
     } else {
         /* --- 航向环: 角度 PI + 速度阻尼 --- */
         float e = yaw_ref_rad - yaw_total_rad;   /* 两边都连续, 不用回绕处理 */
@@ -385,6 +395,14 @@ static bool aim_step(float yaw_ref_rad, float yaw_total_rad,
         }
 
         dtheta = w * SEND_PERIOD_SEC;
+    }
+
+    /* 统一限速 —— 两条路径都走这里。主路径里 w 已经夹过 (冗余但无害),
+     * 兜底路径没有别的保护, 全靠这一道。 */
+    if (dtheta > max_step) {
+        dtheta = max_step;
+    } else if (dtheta < -max_step) {
+        dtheta = -max_step;
     }
 
     return gimbal_step_rad(dtheta);
@@ -435,6 +453,7 @@ int main(void)
     /* --- 找靶 --- */
     float    last_err_x  = 0.0f; /* 最后一次有效 err_x —— 丢靶后往哪边找 */
     uint16_t search_tick = 0;    /* 找靶已经推了多少拍 */
+    bool     ever_seen   = false;/* 曾经识别到过靶纸吗 —— 区分上电找靶/丢靶找靶 */
     float    yaw_rate  = 0.0f;  /* °/s */
     float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
     float    yaw_total  = 0.0f;   /* IMU 连续航向 (rad), 由回绕累加得到 */
@@ -612,23 +631,30 @@ int main(void)
                 /* 阶段 2: 视觉驱动目标航向 —— 用【滤波后】的误差累加到 yaw_ref */
                 if (err_valid) {
                     /* --- 正常闭环 --- */
+                    ever_seen   = true;         /* 标记: 之后丢靶就按方向找 */
                     last_err_x  = err_x_f;      /* 记住方向, 丢靶后要用 */
                     search_tick = 0;
                     if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {
                         yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
                     }
-                } else if ((vis_lost < VISION_LOST_TICKS) &&          /* 视觉还在线 */
-                           (search_tick < SEARCH_MAX_TICKS) &&        /* 还没超时 */
-                           ((last_err_x >  SEARCH_MIN_ERR_PX) ||      /* 且丢靶前误差 */
-                            (last_err_x < -SEARCH_MIN_ERR_PX))) {     /* 足够大 */
-                    /* --- 找靶: 按最后已知方向慢推 yaw_ref --- */
-                    float dir = (last_err_x > 0.0f) ? 1.0f : -1.0f;
-                    yaw_ref += dir * SEARCH_RATE * SEND_PERIOD_SEC;
-                    search_tick++;
+                } else if ((vis_lost < VISION_LOST_TICKS) &&        /* 视觉还在线 */
+                           (search_tick < SEARCH_MAX_TICKS)) {      /* 还没超时 */
+                    if (ever_seen &&
+                        ((last_err_x >  SEARCH_MIN_ERR_PX) ||
+                         (last_err_x < -SEARCH_MIN_ERR_PX))) {
+                        /* --- 丢靶找靶: 按最后已知方向慢推 --- */
+                        float dir = (last_err_x > 0.0f) ? 1.0f : -1.0f;
+                        yaw_ref += dir * SEARCH_RATE * SEND_PERIOD_SEC;
+                        search_tick++;
+                    } else if (!ever_seen) {
+                        /* --- 上电找靶: 从来没见过靶, 固定方向扫 --- */
+                        yaw_ref += BOOT_SEARCH_DIR * SEARCH_RATE * SEND_PERIOD_SEC;
+                        search_tick++;
+                    }
                 }
 #endif
                 if (!aim_step(yaw_ref, yaw_total, yaw_rate_lpf, rate_ok,
-                              err_valid, err_x)) {
+                              err_valid, err_x_f)) {
                     /* 没发出任何分量 —— 发 NOP 保活, 反馈才不会断
                      * (指令 0x00 就是"不改变任何东西, 只为索取反馈报文")。 */
                     gimbal_send_cmd(GIMBAL_CMD_NOP, 0);
