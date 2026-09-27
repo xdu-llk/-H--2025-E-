@@ -172,7 +172,7 @@
  *
  * ⚠️ f 错了环路增益就错。校验法: 靶纸水平平移 50mm @1m, err_x 应变化
  *    约 13.5 px。对不上就按实际比例改 f。 */
-#define AIM_GAIN_RATE           0.005f
+#define AIM_GAIN_RATE           0.014f
 
 /* 死区, 像素。err_x 是量化过的像素值, 零附近有 ±1~2 px 的抖动,
  * 不设死区的话积分器会追着噪声随机游走。
@@ -265,17 +265,17 @@
 #define GYRO_RATE_AXIS      2u
 
 /* 角度环 P, 单位 1/s。Kp=4 -> 时间常数 250 ms (远大于 10 ms 延迟, 安全) */
-#define YAW_KP              8.0f
+#define YAW_KP              4.0f
 
 /* 角度环 I, 单位 1/s²。消掉"车匀速转"时的稳态误差 —— 江南 Ki=0.8 同理 */
-#define YAW_KI              0.0f
+#define YAW_KI              0
 
 /* 积分限幅, rad/s */
 #define YAW_I_LIMIT         0.2f
 
 /* 阻尼系数 (原来的 GYRO_RATE_K)。只做阻尼, 别大。
  * ⚠️ 实测: 纯速率环时 0.3 震 / 0.15 轻微震 / 0 不震 */
-#define YAW_KD              0.10f
+#define YAW_KD              0.1
 
 /* 陀螺速率项的符号 (阻尼用)。反了会"车一转云台就朝同方向猛甩" */
 #define GYRO_RATE_SIGN      (-1.0f)
