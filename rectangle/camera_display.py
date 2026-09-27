@@ -460,11 +460,11 @@ DIGIT_CAM_W = 416           # 模型输入就是 416x416，必须正方形
 DIGIT_CAM_H = 416
 # 置信度阈值。MaixHub 示例用 0.5；放宽到 0.4 能多检出一些，误检交给下面的
 # "连续多帧确认"去滤。
-DIGIT_CONF_TH = 0.
-DIGIT_IOU_TH = 0.9
+DIGIT_CONF_TH = 0.4
+DIGIT_IOU_TH = 0.45
 # 连续多少帧都是同一个数字才认。单帧准确率只有 93.2%（模型报告里 val_acc），
 # 连 5 帧能把误判压到千分之几。
-DIGIT_CONFIRM_N = 1
+DIGIT_CONFIRM_N = 3
 
 # ⚠️ 模型要 416x416，而瞄准画面是 416x260 —— 居中裁 260x260 再缩放（方案 B）
 DIGIT_CROP_N = 260
@@ -645,16 +645,20 @@ def load_digit_model():
 
 
 def crop_for_digit(frame_rgb):
-    """416x260 -> 居中裁 260x260 -> 缩放到 416x416（方案 B）。
+    """416x260 -> 居中裁 260x260 -> 缩放到 416x416 -> 转成 maix Image（方案 B）。
 
-    ⚠️ 只看画面中间那块。数字牌在画面边缘会看不到 —— 但数字识别是在
-       【瞄准稳定后】才开的，那时靶纸已经在画面中心附近了。
+    ⚠️ 只看画面中间那块。数字牌在画面边缘会看不到 —— 所以数字识别要等
+       【瞄准稳定】之后再开，那时靶纸已经在画面中心附近了。
+    ⚠️ 返回值必须是 maix Image，不能是 numpy：
+       YOLOv5.detect() 只收 Image，喂 numpy 会报
+       "incompatible function arguments"。
     """
     h, w = frame_rgb.shape[:2]
     s = min(h, w, DIGIT_CROP_N)
     x0 = (w - s) // 2
     y0 = (h - s) // 2
-    return cv2.resize(frame_rgb[y0:y0 + s, x0:x0 + s], (DIGIT_CAM_W, DIGIT_CAM_H))
+    crop = cv2.resize(frame_rgb[y0:y0 + s, x0:x0 + s], (DIGIT_CAM_W, DIGIT_CAM_H))
+    return image.cv2image(crop, bgr=False, copy=True)
 
 
 def detect_digit(detector, frame_rgb):
@@ -1642,7 +1646,10 @@ def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
     ⚠️ 认不出要一直认（车必须拿到数字才能停车），所以必须降频，不能每帧跑。
     """
     digit_model = load_digit_model()     # ★ 开机就加载, 别等瞄准稳定再加载(会卡几秒)
-    digit_on = (digit_model is not None) # 数字识别是否已开启
+    # ⚠️ 必须 False！crop_for_digit 只裁画面正中的 260x260, 靶纸没对准中心时
+    #    数字牌根本不在裁剪窗口里 —— 那样开多久都认不出。
+    #    置 False 才会走下面【阶段①: 等瞄准稳定】再开。
+    digit_on = False                     # 数字识别是否已开启
     digit_done = False                   # 是否已经发过(发过就彻底关掉)
     digit_ready = 0                      # 连续"瞄准好"的帧数
     digit_last = 0                       # 上一次认出的数字

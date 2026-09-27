@@ -206,8 +206,9 @@
 /* 最多推这么多拍 (5ms/拍 -> 8 秒 = 368°, 扫满一圈)。找到就退出, 8s 是最坏情况 */
 #define SEARCH_MAX_TICKS    1600u
 
-/* 上电扫描方向。云台无限位可连续转, 固定往一个方向扫就行 */
-#define BOOT_SEARCH_DIR     1.0f
+/* 上电扫描方向。-1 = 反方向。
+ * ⚠️ 2026-09-27 实测: +1 扫的方向反了 (跑道上靶子在顺时针很小的角度内)。 */
+#define BOOT_SEARCH_DIR     (-1.0f)
 
 /* ==========================================================================
  * 速率环 (陀螺在云台上 -> 是反馈环)
@@ -306,6 +307,13 @@ static float vision_rate(void)
  * 反方向变; 同方向变就是 RATE_SIGN 反了 */
 static int16_t g_last_rpm = 0;
 
+/* 速度指令的小数余量。
+ * ⚠️ 0x04 的 rpm 是【整数】, 但低速时需要远细于 1 rpm 的分辨率: VIS_KP=0.8
+ *    时 err_x<7.5px 的指令都不足 1 rpm, 直接取整就恒为 0 —— 云台最后那一段
+ *    完全没劲, 表现是"越靠近靶心越慢"。把余量攒起来、够 1 再发, 平均下来
+ *    等效能发出 0.1 rpm 量级的速度, 而且【不动环路增益】。 */
+static float s_rpm_frac = 0.0f;
+
 /* 算并发出这一拍的速度指令: w = 瞄准项 + 自稳项 (°/s), 限幅后换算成 rpm。
  * gyro_ok=false 时摘掉自稳项 —— 拿陈旧角速度反馈会变成正反馈跑飞。
  * 返回 false 表示这一拍没发。 */
@@ -324,8 +332,13 @@ static bool rate_cmd(float w_aim_dps, float yaw_rate_dps, bool gyro_ok)
         w = -W_MAX_DPS;
     }
 
-    /* 0x04 要的是原始 rpm, 不像 0x07 要按 2π 缩放 */
-    rpm = (int16_t) (w / DPS_PER_RPM);
+    /* 0x04 要的是原始 rpm, 不像 0x07 要按 2π 缩放。
+     * 小数部分不能丢 —— 攒到下一拍, 否则小误差永远发不出指令 (见 s_rpm_frac) */
+    {
+        float rpm_f = w / DPS_PER_RPM + s_rpm_frac;
+        rpm        = (int16_t) rpm_f;
+        s_rpm_frac = rpm_f - (float) rpm;
+    }
     if (gimbal_set_speed_rpm(rpm)) {
         g_last_rpm = rpm;       /* ⚠️ 只在真发出去之后才记 —— 发失败也记的话 W 证明不了任何事 */
         return true;
