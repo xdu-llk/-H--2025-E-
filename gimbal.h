@@ -49,7 +49,8 @@
 #define GIMBAL_CMD_ENABLE       0x01u
 #define GIMBAL_CMD_DISABLE      0x02u
 #define GIMBAL_CMD_CURRENT      0x03u   /* int16, -10 ~ 10 A */
-#define GIMBAL_CMD_SPEED        0x04u   /* int16, -1000 ~ 1000 rpm */
+#define GIMBAL_CMD_SPEED        0x04u   /* int16, 编码同 0x07: ±32767 = ±1000 rpm */
+#define GIMBAL_RPM_MAX          1000    /* 手册 limit.speed, 上位机也是这个值 */
 #define GIMBAL_CMD_ANGLE        0x05u   /* uint16, 0 ~ 2π rad (绝对) */
 #define GIMBAL_CMD_LOW_SPEED    0x06u
 #define GIMBAL_CMD_ANGLE_STEP   0x07u   /* int16, -2π ~ 2π rad (增量) */
@@ -111,13 +112,15 @@ void gimbal_poll(void);
  * 或者 UART 发不出去(异常)。 */
 bool gimbal_send_cmd(uint8_t cmd, int16_t value);
 
-/* 角度步进 (指令 0x07)。dtheta 单位 rad, 内部按 -2π~2π 夹紧。
- * 这是视觉外环 -> 云台的唯一入口。 */
-bool gimbal_step_rad(float dtheta);
+/* 速度模式 (指令 0x04)。传【真实 rpm】(±1000), 内部按 rpm/1000×32767 缩放。
+ * 【速率环】架构的唯一入口。 */
+bool gimbal_set_speed_rpm(int16_t rpm);
+
+/* 最近一次发出去的整帧 (5 字节), 调试用 —— 直接看我们发的 ID / 命令码 / 数值 /
+ * CRC 对不对, 不用拿串口助手去接 UART1。长度和 gimbal.c 的 GIMBAL_TX_LEN 一致。 */
+extern volatile uint8_t g_gimbal_tx[5];
 
 bool gimbal_enable(void);
-bool gimbal_disable(void);
-bool gimbal_set_zero(void);
 bool gimbal_clear_error(void);
 
 /* 取最近一帧反馈。有新帧返回 true 并填充 *out。任务上下文调用。 */
