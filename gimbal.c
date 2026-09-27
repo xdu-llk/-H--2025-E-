@@ -179,20 +179,21 @@ bool gimbal_send_cmd(uint8_t cmd, int16_t value)//cmd命令模式，后面为要
     return true;
 }
 
-bool gimbal_set_speed_rpm(int16_t rpm)
+bool gimbal_set_speed(float rpm)
 {
-    if (rpm > GIMBAL_RPM_MAX) {
-        rpm = GIMBAL_RPM_MAX;
-    } else if (rpm < -GIMBAL_RPM_MAX) {
-        rpm = -GIMBAL_RPM_MAX;
+    if (rpm > (float) GIMBAL_RPM_MAX) {
+        rpm = (float) GIMBAL_RPM_MAX;
+    } else if (rpm < -(float) GIMBAL_RPM_MAX) {
+        rpm = -(float) GIMBAL_RPM_MAX;
     }
     /* 协议里模拟量都是【定点数】, 满量程映到 32767:
      *     角度 0x07:  θ   / (2π)  × 32767
      *     速度 0x04:  rpm / 1000  × 32767     (1000 = limit.speed)
      * ⚠️ 漏了这一步的话, 电机把 7 当成 7/32767×1000 = 0.2 rpm, 几乎不动 ——
-     *    表现就是"下了速度指令但云台不转"。 */
+     *    表现就是"下了速度指令但云台不转"。
+     * ⚠️ 全程不取整: 1 LSB = 0.031 rpm = 0.18°/s, 比整数 rpm 细 33 倍。 */
     return gimbal_send_cmd(GIMBAL_CMD_SPEED,
-                           (int16_t) ((float) rpm / (float) GIMBAL_RPM_MAX *
+                           (int16_t) (rpm / (float) GIMBAL_RPM_MAX *
                                       GIMBAL_RAW_PER_TURN));
 }
 

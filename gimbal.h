@@ -112,9 +112,12 @@ void gimbal_poll(void);
  * 或者 UART 发不出去(异常)。 */
 bool gimbal_send_cmd(uint8_t cmd, int16_t value);
 
-/* 速度模式 (指令 0x04)。传【真实 rpm】(±1000), 内部按 rpm/1000×32767 缩放。
+/* 速度模式 (指令 0x04)。传【真实 rpm】(±1000, 可以是小数), 内部按
+ * rpm/1000×32767 编码。
+ * ⚠️ 收 float 不收 int —— 协议本身是定点数(1 LSB = 0.031 rpm), 拿整数 rpm
+ *    当接口的话低速分辨率只剩 1 rpm = 6°/s, 最后几像素会走出"顿挫"。
  * 【速率环】架构的唯一入口。 */
-bool gimbal_set_speed_rpm(int16_t rpm);
+bool gimbal_set_speed(float rpm);
 
 /* 最近一次发出去的整帧 (5 字节), 调试用 —— 直接看我们发的 ID / 命令码 / 数值 /
  * CRC 对不对, 不用拿串口助手去接 UART1。长度和 gimbal.c 的 GIMBAL_TX_LEN 一致。 */

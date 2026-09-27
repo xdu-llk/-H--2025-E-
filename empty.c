@@ -143,7 +143,7 @@
  * 视觉外环 (位置 P + 速率前馈)
  * ========================================================================== */
 /* 位置 P, (°/s)/px。0.80 = 旧 AIM_GAIN_RATE(0.014 rad) × 57.3, 视觉带宽不变 */
-#define VIS_KP_DPS_PER_PX       0.80f   //
+#define VIS_KP_DPS_PER_PX       1.0f   //
 
 /* 像素焦距, px/rad。⚠️ 推算值, 没实测。速率前馈【绝对依赖】它 —— 错了前馈
  * 就整体偏一个比例, 没法靠调 P 吸收。校验: 靶纸平移 50mm@1m 应使 err_x 变 13.5px */
@@ -162,7 +162,7 @@
  * ⚠️ 指标: 光斑 0.5cm @最远 1.25m ≈ 1.1 px (f=271) —— 死区必须小于它,
  *    否则光斑永远进不到靶心。1.0 正好卡在指标上, 再紧就压到卡尔曼的噪声底下了。
  *    实测若抖得厉害, 说明噪声比预期大, 退回 1.5 并把 KF_R 调大。 */
-#define AIM_DEADBAND_PX         1.0f
+#define AIM_DEADBAND_PX         0.5f
 
 /* 速度指令上限, °/s = 20 rpm。比搜索(46°/s)有余量, 又远小于电机 1000 rpm */
 #define W_MAX_DPS               120.0f
@@ -303,24 +303,16 @@ static float vision_rate(void)
     return s_kf_x1;
 }
 
-/* 最近一次发出的速度指令 (rpm)。调试行用它验自稳符号: 手转小车时 W 该朝
- * 反方向变; 同方向变就是 RATE_SIGN 反了 */
-static int16_t g_last_rpm = 0;
-
-/* 速度指令的小数余量。
- * ⚠️ 0x04 的 rpm 是【整数】, 但低速时需要远细于 1 rpm 的分辨率: VIS_KP=0.8
- *    时 err_x<7.5px 的指令都不足 1 rpm, 直接取整就恒为 0 —— 云台最后那一段
- *    完全没劲, 表现是"越靠近靶心越慢"。把余量攒起来、够 1 再发, 平均下来
- *    等效能发出 0.1 rpm 量级的速度, 而且【不动环路增益】。 */
-static float s_rpm_frac = 0.0f;
+/* 最近一次发出的速度指令 (rpm, 小数)。调试行打的是 ×10 的值。
+ * 验自稳符号用它: 手转小车时 W 该朝反方向变; 同方向变就是 RATE_SIGN 反了 */
+static float g_last_rpm = 0.0f;
 
 /* 算并发出这一拍的速度指令: w = 瞄准项 + 自稳项 (°/s), 限幅后换算成 rpm。
  * gyro_ok=false 时摘掉自稳项 —— 拿陈旧角速度反馈会变成正反馈跑飞。
  * 返回 false 表示这一拍没发。 */
 static bool rate_cmd(float w_aim_dps, float yaw_rate_dps, bool gyro_ok)
 {
-    float   w = w_aim_dps;
-    int16_t rpm;
+    float w = w_aim_dps;
 
     if (gyro_ok) {
         w += RATE_SIGN * RATE_K * yaw_rate_dps;
@@ -332,15 +324,11 @@ static bool rate_cmd(float w_aim_dps, float yaw_rate_dps, bool gyro_ok)
         w = -W_MAX_DPS;
     }
 
-    /* 0x04 要的是原始 rpm, 不像 0x07 要按 2π 缩放。
-     * 小数部分不能丢 —— 攒到下一拍, 否则小误差永远发不出指令 (见 s_rpm_frac) */
-    {
-        float rpm_f = w / DPS_PER_RPM + s_rpm_frac;
-        rpm        = (int16_t) rpm_f;
-        s_rpm_frac = rpm_f - (float) rpm;
-    }
-    if (gimbal_set_speed_rpm(rpm)) {
-        g_last_rpm = rpm;       /* ⚠️ 只在真发出去之后才记 —— 发失败也记的话 W 证明不了任何事 */
+    /* °/s -> rpm。⚠️ 传小数、不要在这里取整 —— 取整会把低速分辨率砍到
+     * 1 rpm = 6°/s, 最后几像素的指令就恒为 0, 走出"顿挫 + 收不进去"。
+     * 编码在 gimbal_set_speed() 里做, 1 LSB = 0.18°/s。 */
+    if (gimbal_set_speed(w / DPS_PER_RPM)) {
+        g_last_rpm = w / DPS_PER_RPM;   /* 只在真发出去后才记; 发失败也记的话 W 证明不了任何事 */
         return true;
     }
     return false;
@@ -593,15 +581,15 @@ int main(void)
          *   E / Ef  原始 / 滤波后的 err_x (px), 控制用 Ef
          *   R       偏航角速度 (°/s), ⚠️ 打印的是 ×10
          *   K       当前 RATE_K ×100 —— 确认板子跑的是哪版
-         *   W       本拍发出的速度指令 (rpm) —— 验自稳符号看它: 手转小车该朝
-         *           反方向变; 同方向变 = RATE_SIGN 反了
+         *   W       本拍发出的速度指令 (rpm), ⚠️ 打印的是 ×10 的值
+         *           验自稳符号看它: 手转小车该朝反方向变; 同方向变 = RATE_SIGN 反了
          *   Vf      卡尔曼估的误差变化率 (px/s ×10), 速率前馈用的就是它。
          *           靶匀速平移时 Vf 稳定在非零值、Ef 接近 0; 若 Ef 一直差一截
          *           不收敛, 说明前馈不够 (调 F_PX 或 LOS_FF_GAIN)
          */
         if (++dbg_tick >= DEBUG_PERIOD_TICKS) {
             dbg_tick = 0;
-            printf("K=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld Ef=%ld R=%ld |R|=%ld | W=%d Vf=%ld | TX=%02x %02x %02x %02x %02x\r\n",
+            printf("K=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld Ef=%ld R=%ld |R|=%ld | W=%ld Vf=%ld | TX=%02x %02x %02x %02x %02x\r\n",
                    (int) (RATE_K * 100.0f),           /* 自稳增益 K ×100 */
                    (unsigned long) vcount,
                    (unsigned long) g_vision_bad_csum,
@@ -616,7 +604,7 @@ int main(void)
                    (long) err_x_f,                              /* Ef: 滤波后 (控制用) */
                    (long) (yaw_rate * 10.0f),                   /* R: °/s ×10 */
                    (long) (((rabs_cnt > 0u) ? (rabs_sum / (float) rabs_cnt) : 0.0f) * 10.0f),
-                   (int) g_last_rpm,                            /* W: 速度指令 (rpm) */
+                   (long) (g_last_rpm * 10.0f),                 /* W: 速度指令 (rpm ×10) */
                    (long) (vision_rate() * 10.0f),              /* Vf: 误差变化率 (px/s ×10) */
                    (unsigned) g_gimbal_tx[0], (unsigned) g_gimbal_tx[1],
                    (unsigned) g_gimbal_tx[2], (unsigned) g_gimbal_tx[3],
