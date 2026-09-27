@@ -63,6 +63,10 @@ static inline float gyro_raw_to_dps(int16_t raw)
  * 调用时机: SYSCFG_DL_init() 之后。 */
 void gyro_link_init(void);
 
+/* 每 1 ms 调一次。陀螺开机要 ~5 s 才就绪, 初始化命令会丢 —— 没收到全数据帧
+ * 之前定期重发。不调的话模式切换失败, 帧里没角速度, 自稳完全失效。 */
+void gyro_link_poll(void);
+
 /* 取最近一帧上报数据。有新帧返回 true 并填充 *out。任务上下文调用。 */
 bool gyro_link_get(gyro_msg_t *out);
 

@@ -13,6 +13,16 @@
 #define GYRO_TX_DELAY_CYCLES 3200u                  /* 115200 无校验, 见 SDK UART.md */
 
 static volatile gyro_msg_t s_msg;
+
+/* --- 上电重试 ---
+ * 陀螺模块要 ~5 s 才就绪, 主控复位比它早得多 —— 初始化命令会全打在空气里,
+ * 模块就停在默认的【仅姿态】模式。那种帧里没有角速度, 表现是 G 在涨但 R 恒为
+ * 0、云台完全不自稳 (很难往这上面想)。
+ * ⇒ 没收到【全数据帧】之前, 定期重发初始化命令。 */
+#define GYRO_RETRY_TICKS    500u
+
+static uint16_t s_retry_ticks = 0;
+static bool     s_mode_ok     = false;
 static volatile bool       s_ready;
 
 volatile uint32_t g_gyro_rx_count  = 0u;
@@ -62,6 +72,7 @@ static void gyro_parse(void)
     }
 
     if (len == GYRO_MAX_DATA) {
+        s_mode_ok = true;               /* 模式切换成功, 不用再重试 */
         /* 模式 0: AccX,AccY,AccZ, GyroX,GyroY,GyroZ, Pitch,Roll,Yaw */
         for (i = 0u; i < 3u; i++) {
             s_msg.acc_raw[i] = (int16_t)((uint16_t) s_buf[5u + 2u * i] |
@@ -213,17 +224,37 @@ bool gyro_link_send_cmd(uint8_t cmd, const uint8_t *data, uint8_t len)
  * 对外接口
  * ========================================================================== */
 
-void gyro_link_init(void)
+/* 切全数据模式 + 启动上报。
+ * ⚠️ 模块要 ~5 s 才就绪, 开机时发这两条会丢 —— 所以 gyro_link_poll() 会重发。 */
+static void gyro_link_send_init(void)
 {
     const uint8_t mode_full = 0x00u;    /* 0 = 全数据模式 (含原始陀螺) */
     const uint8_t rep_on    = 0x01u;    /* 1 = 启动上报 */
 
-    /* SysConfig 只生成外设级中断使能, NVIC 这一层要自己开 */
-    NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
-
     /* 必须先切全数据模式: 速率环要的是 GyroZ 原始角速度, 仅姿态模式给不了 */
     gyro_link_send_cmd(GYRO_CMD_SET_MODE, &mode_full, 1u);
     gyro_link_send_cmd(GYRO_CMD_REPORT_CTRL, &rep_on, 1u);
+}
+
+void gyro_link_init(void)
+{
+    /* SysConfig 只生成外设级中断使能, NVIC 这一层要自己开 */
+    NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
+
+    gyro_link_send_init();
+}
+
+/* 每 1 ms 调一次。陀螺还没切到全数据模式就定期重发初始化命令。 */
+void gyro_link_poll(void)
+{
+    if (s_mode_ok) {
+        return;                 /* 已经收到全数据帧, 不用再管 */
+    }
+    if (++s_retry_ticks < GYRO_RETRY_TICKS) {
+        return;
+    }
+    s_retry_ticks = 0;
+    gyro_link_send_init();
 }
 
 bool gyro_link_get(gyro_msg_t *out)
