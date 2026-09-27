@@ -174,12 +174,31 @@
  *    约 13.5 px。对不上就按实际比例改 f。 */
 #define AIM_GAIN_RATE           0.014f
 
+/* 像素焦距, px/rad。⚠️ 推算值, 没实测 (OS04D10 按 416x260 居中裁剪)。
+ * 只用在速率前馈的换算上: 前馈要 x1(px/s) / f 才是真实角速度。 */
+#define F_PX                    271.0f
+
+/* 视线角速度前馈增益。
+ *
+ * 补偿的是【积分器的速度误差】: yaw_ref 要以 ω 匀速涨, 就必须有恒定输入 ——
+ *     dyaw_ref/dt = AIM_GAIN_RATE × err_x = ω   ⇒   err_x = ω / AIM_GAIN_RATE
+ * 这个滞后【必须存在】, 否则 yaw_ref 涨不上去 ⇒ 云台永远落后靶心一截。
+ * 把斜率直接喂进去, 它就不用靠误差去攒了。
+ *
+ * 前馈量 = ω_视线 = ω_云台 + d(err_x)/dt / f
+ *                    └ 陀螺 ┘   └── 视觉 ──┘
+ * 是【恒等式】(err_x = f·(θ靶−θ云台) 两边求导即得), 不含任何赛道模型:
+ *   陀螺给绝对角速度, 视觉变化率给相对角速度, 合成视线的绝对角速度。
+ *
+ * 1.0 = 理论值。⚠️ 卡尔曼的 x1 有噪声和滞后, 实测有过冲就往下调 (0.7~0.8)。 */
+#define LOS_FF_GAIN             1.0f
+
 /* 死区, 像素。err_x 是量化过的像素值, 零附近有 ±1~2 px 的抖动,
  * 不设死区的话积分器会追着噪声随机游走。
  * 2 px ≈ 0.38° (按 f=300), 在 1 m 处是 6.7 mm —— 远小于 3 cm 指标, 尽管取。
  * ⚠️ 死区只作用于**视觉项**; 速率项不受它影响 —— 云台被扰动就得压住, 跟视觉
  *    误差在不在死区里没关系。 */
-#define AIM_DEADBAND_PX         2.0f
+#define AIM_DEADBAND_PX         1.0f
 
 /* 转角速率上限, rad/s。重新捕获目标时 err_x 可能有几百像素, 不限速会甩一下。
  * 1.67 rad/s ≈ 95°/s, 既保护机械又不影响 2 s 内收敛。
@@ -212,39 +231,39 @@
 #define KF_Q_RATE       10.0f
 
 /* 目标丢失超过这么久(ms)就复位滤波器, 免得重新捕获时旧状态造成跳变 */
-#define KF_RESET_TICKS  200u
+#define KF_RESET_MS     5000u
 
 /* ==========================================================================
  * 找靶 (视觉在线, 但没识别到靶纸时)
- * ---------------------------------------------------------------------------
- * 丢靶后不干等 —— 记住【最后一次有效 err_x 的方向】, 以固定速率慢推 yaw_ref,
- * 把云台扫回去。航向环照常工作, 所以扫描期间自稳不受影响。
- *
- * ⚠️ 本质只是"人为地推 yaw_ref", 和视觉推是同一个机制, 不新增一层控制。
- * ⚠️ 单向扫。若靶纸在身后(超过扫过的角度)就找不回来 —— 那要升级成往返扫。
  * ========================================================================== */
 
-/* 扫描速率, rad/s ≈ 46°/s。
- * 依据: 曝光 5 ms 时运动模糊 = rate × 0.005 rad, 46°/s 下只有 0.22° ≈ 1 px, 可接受 */
+/* 找靶总开关。0 = 完全不找靶 (丢靶就守在当前朝向自稳, 云台不转)。 */
+#define SEARCH_ENABLE       0
+
+/* 扫描速率, rad/s ≈ 46°/s。 */
 #define SEARCH_RATE         0.80f
 
 /* 丢靶前误差小于这个就不搜 —— 靶纸就在附近(比如被人遮挡), 乱搜反而跑远 */
 #define SEARCH_MIN_ERR_PX   5.0f
 
-/* 连续丢这么多【帧】才启动搜索。
+/* 连续丢靶超过这么久(ms)才启动找靶。
+ * ⚠️ 判据一律用【时间】不用帧数 —— 视觉帧率随场景变(同一份参数能差好几倍),
+ *    帧数没有确定的时间含义。
  * ⚠️ 没它的话, 视觉单帧检测失败就立刻以 SEARCH_RATE(46°/s) 猛推 yaw_ref ——
- *    而视觉环在 err_x=10px 时本来只该推 0.05 rad/s, 差十几倍。
+ *    而视觉环在 err_x=10px 时本来只该推 0.1 rad/s, 差十几倍。
  *    于是: 检测一抖 -> 猛推 -> 冲过靶心 -> 反向再推 -> 停不下来。
- * 取 10 的道理: 门槛没到时 yaw_ref 是冻住的, 航向环照常自稳 —— 等待期云台只是
- *    原地保持指向, 不是空转。而真丢靶后光扫一圈就要 8s, 晚 200ms 起步无所谓。
- *    代价单向偏小, 所以宁可取大。 */
-#define SEARCH_CONFIRM_FRAMES   10u
+ * 500 ms 的道理: 门槛没到时 yaw_ref 冻住, 航向环照常自稳 —— 等待期云台只是
+ *    原地保持指向。而真丢靶后光扫一圈就要 8 s, 晚 500 ms 起步无所谓。 */
+#define SEARCH_LOST_MS      500u
 
-/* 最多推这么多拍。累加块每 5 ms 跑一次 -> 1600 拍 = 8 秒
- * 扫过的角度 = SEARCH_RATE × 8 s = 6.4 rad ≈ 366°, 扫满一圈。
- * ⇒ 上电时不管停在哪个位置、靶纸在哪个方向, 一圈之内必能找到。
- * ⇒ 找到就立刻退出, 所以 8 秒只是最坏情况。 */
-#define SEARCH_MAX_TICKS    1600u
+/* 一次找靶最多扫这么久。8 s × SEARCH_RATE(0.80 rad/s) = 6.4 rad ≈ 366°, 扫满一圈。 */
+#define SEARCH_MAX_MS       8000u
+
+/* 误差收进这个范围才算【真锁定】, 才允许重置扫描预算。
+ * ⚠️ 不能用"看到靶"当条件: 扫描途中云台扫过靶会连续几十帧看到靶, 但那时
+ *    err_x 还在几十~几百 px 摆动 —— 每次都重置的话 8 s 上限永远走不完。
+ * ⇒ 预算只增不减 (除非真锁定), 所以扫描时间有【硬上限】。 */
+#define SEARCH_LOCK_PX      20.0f
 
 /* 上电扫描方向。-1 = 反方向。
  * ⚠️ 2026-09-27 实测: +1 扫的方向反了 (跑道上靶子在顺时针很小的角度内)。 */
@@ -277,14 +296,12 @@
  * ⚠️ 实测: 纯速率环时 0.3 震 / 0.15 轻微震 / 0 不震 */
 #define YAW_KD              0.1
 
-/* 陀螺速率项的符号 (阻尼用)。反了会"车一转云台就朝同方向猛甩" */
+/* 陀螺速率项符号 (阻尼用)。反了会"车一转云台就朝同方向猛甩"。
+ * ⚠️ 和速率环版的 RATE_SIGN 是同一个物理量, 那版实测 -1.0f 是对的。 */
 #define GYRO_RATE_SIGN      (-1.0f)
 
-/* ⚠️ 模块的 Yaw 与它自己的 GyroZ 【符号相反】—— 2026-09-23 实测:
- *        手转云台时 gZ 持续为正, 而 yaw100 持续下跌。
- *    我们的控制律要求两者同向, 所以累加时翻一下。
- *    不翻的话角度环会变成【正反馈】-> 云台一直转、回不到目标。
- *    ⚠️ 副作用: 调试行的 Y 显示的是翻转后的值, 和模块原始 Yaw 差个正负号。 */
+/* 模块 Yaw 与 GyroZ 符号相反, 累加时翻一下。
+ * ⚠️ 2026-09-27: 试过 +1, 云台一直转不停, 说明这个方向才是对的。 */
 #define YAW_SIGN            (-1.0f)
 
 /* 阶段开关: 1 = 只测自稳(yaw_ref 固定, 不接视觉) / 0 = 接视觉
@@ -457,14 +474,14 @@ int main(void)
 
     float    err_x     = 0.0f;   /* 原始误差 (调试用) */
     float    err_x_f   = 0.0f;   /* 卡尔曼滤波后的误差 —— 控制用这个 */
-    uint16_t tgt_lost  = 0;      /* 连续丢靶的帧数, 用来决定何时复位滤波器 */
+    uint16_t lost_ms   = 0;      /* 距上次看到靶过了多少 ms (找靶和卡尔曼复位的判据) */
     bool     err_valid = false;
 
     /* --- 找靶 --- */
     float    last_err_x  = 0.0f; /* 最后一次有效 err_x —— 丢靶后往哪边找 */
-    uint16_t search_tick = 0;    /* 找靶已经推了多少拍 */
+    uint16_t search_ms   = 0;    /* 本次找靶已经扫了多少 ms */
     bool     ever_seen   = false;/* 曾经识别到过靶纸吗 —— 区分上电找靶/丢靶找靶 */
-    bool     searching   = false;/* 上一拍在搜索? 认回靶时要拉平 yaw_ref */
+    bool     searching   = false;/* 上一拍真推过 yaw_ref? 认回靶时要拉平 */
     float    yaw_rate  = 0.0f;  /* °/s */
     float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
     float    yaw_total  = 0.0f;   /* IMU 连续航向 (rad), 由回绕累加得到 */
@@ -519,19 +536,15 @@ int main(void)
             need_send = true;       /* 有新帧 -> 这一拍立刻发出去 */
             if (vmsg.status == VISION_STATUS_TARGET_VALID) {
                 err_x = (float) vmsg.err_x;      /* 原始值, 调试用 */
-                if (tgt_lost >= KF_RESET_TICKS) {
+                if (lost_ms >= KF_RESET_MS) {
                     vision_filter_reset();       /* 丢太久, 重新捕获 -> 复位 */
                 }
                 err_x_f   = vision_filter(err_x, dt_vis);   /* 滤波后, 控制用 */
                 err_valid = true;
-                tgt_lost  = 0;
             } else {
                 /* 丢靶。⚠️ err_x 恒为 0 是"无数据"不是"已对准", 必须用
                  * err_valid 区分开。视觉项归零后, 航向环继续维持自稳。 */
                 err_valid = false;
-                if (tgt_lost < 0xFFFFu) {
-                    tgt_lost++;
-                }
             }
         } else if (vis_lost < 0xFFFFu) {
             vis_lost++;
@@ -541,6 +554,14 @@ int main(void)
          * (放在这里而不是塞进 if 里, 是因为"没收到帧"这个分支也要判。) */
         if (vis_lost >= VISION_LOST_TICKS) {
             err_valid = false;
+        }
+
+        /* 距上次看到靶过了多少 ms —— 找靶启动和滤波器复位的统一判据。
+         * ⚠️ 用时间不用帧数: 视觉帧率随场景变, 帧数没有确定的时间含义。 */
+        if (err_valid) {
+            lost_ms = 0;
+        } else if (lost_ms < 0xFFFFu) {
+            lost_ms++;
         }
 
         /* --- 陀螺 --- */
@@ -638,41 +659,61 @@ int main(void)
             } else {
                 /* 陀螺掉线时把速率项置无效, 别拿陈旧角速度继续猛补 */
                 bool rate_ok = (gyro_lost < GYRO_LOST_TICKS);
+                /* 视觉在线? ⚠️ 上电时 MaixCam 要好几秒才起来 (实测 ~44 s),
+                 *    这期间 vis_lost 一路涨 —— 不在线就绝不找靶, 免得盲扫。 */
+                bool vis_ok  = (vis_lost  < VISION_LOST_TICKS);
 
 #if !YAW_HOLD_ONLY
-                /* 阶段 2: 视觉驱动目标航向 —— 用【滤波后】的误差累加到 yaw_ref */
+                /* --- 阶段 2: 视觉驱动目标航向 ---
+                 * 看到靶 -> 立刻停搜索, 用【滤波后】的误差累加 yaw_ref。 */
                 if (err_valid) {
-                    /* --- 正常闭环 --- */
                     ever_seen   = true;         /* 标记: 之后丢靶就按方向找 */
                     last_err_x  = err_x_f;      /* 记住方向, 丢靶后要用 */
-                    search_tick = 0;
-                    /* 刚搜回来: 搜索期间 yaw_total 追不上 SEARCH_RATE 的扫描速度,
-                     * 一直落后 yaw_ref 约 SEARCH_RATE/YAW_KP = 0.1 rad。这份"超前量"
-                     * 留在 yaw_ref 里的话, 航向环会继续把云台往那个方向推 —— 就是
-                     * "冲过靶心再拉回"。拉平到云台实际位置即可, 剩下的误差交给
-                     * 视觉环按 err_x 积分去补。 */
+                    /* 从搜索切回跟踪: 【无条件】拉平。搜索期间 yaw_ref 比
+                     * yaw_total 领先约 SEARCH_RATE/YAW_KP ≈ 0.2 rad (11.5°),
+                     * 不拉掉的话航向环会继续把云台推过去 -> 冲过靶心 -> 靶出画
+                     * -> 又丢靶又扫, 就是"变缓但停不住"。 */
                     if (searching) {
                         yaw_ref   = yaw_total;
                         searching = false;
                     }
-                    if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {
-                        yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
+                    /* 真锁定了才重置扫描预算。扫过靶不算 (那时 err_x 还很大),
+                     * 否则预算被反复清零, 8 s 上限永远走不完。 */
+                    if ((err_x_f > -SEARCH_LOCK_PX) && (err_x_f < SEARCH_LOCK_PX)) {
+                        search_ms = 0;
                     }
-                } else if ((vis_lost < VISION_LOST_TICKS) &&        /* 视觉还在线 */
-                           (tgt_lost >= SEARCH_CONFIRM_FRAMES) &&   /* 确认真丢了 */
-                           (search_tick < SEARCH_MAX_TICKS)) {      /* 还没超时 */
-                    searching = true;
-                    if (ever_seen &&
-                        ((last_err_x >  SEARCH_MIN_ERR_PX) ||
-                         (last_err_x < -SEARCH_MIN_ERR_PX))) {
-                        /* --- 丢靶找靶: 按最后已知方向慢推 --- */
-                        float dir = (last_err_x > 0.0f) ? 1.0f : -1.0f;
-                        yaw_ref += dir * SEARCH_RATE * SEND_PERIOD_SEC;
-                        search_tick++;
-                    } else if (!ever_seen) {
-                        /* --- 上电找靶: 从来没见过靶, 固定方向扫 --- */
-                        yaw_ref += BOOT_SEARCH_DIR * SEARCH_RATE * SEND_PERIOD_SEC;
-                        search_tick++;
+                    if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {
+                        /* 速率前馈: 陀螺给绝对角速度, 卡尔曼的 x1/f 给相对角速度,
+                         * 合起来就是视线的绝对角速度 —— 见 LOS_FF_GAIN。 */
+                        float w_los = yaw_rate_lpf * DEG2RAD + s_kf_x1 / F_PX;
+                        yaw_ref += (AIM_GAIN_RATE * err_x_f +
+                                    LOS_FF_GAIN * w_los) * SEND_PERIOD_SEC;
+                    }
+                }
+
+                /* --- 找靶 ---
+                 * ⚠️ 故意用【独立 if】而非 else if: 这样 searching 只在真推了
+                 *    yaw_ref 时才置位。塞进 else if 的话, "丢靶但误差太小不搜"
+                 *    也会被标成 searching, 下次看到靶就误触发上面的拉平。 */
+                if (SEARCH_ENABLE &&
+                    !err_valid &&
+                    vis_ok &&                             /* 视觉在线 */
+                    (lost_ms   >= SEARCH_LOST_MS) &&      /* 丢得够久才搜 */
+                    (search_ms <  SEARCH_MAX_MS)) {       /* 本次还没扫够一圈 */
+                    if (!ever_seen) {
+                        /* 上电找靶: 还没见过靶, 固定方向扫 */
+                        yaw_ref   += BOOT_SEARCH_DIR * SEARCH_RATE * SEND_PERIOD_SEC;
+                        search_ms += SEND_PERIOD_TICKS;
+                        searching  = true;
+                    } else if ((last_err_x >  SEARCH_MIN_ERR_PX) ||
+                               (last_err_x < -SEARCH_MIN_ERR_PX)) {
+                        /* 丢靶找靶: 按最后看到靶的方向扫。
+                         * ⚠️ 误差太小就不搜 —— 靶纸可能就在附近(比如被人挡住),
+                         *    乱扫反而跑远。 */
+                        yaw_ref   += ((last_err_x > 0.0f) ? 1.0f : -1.0f) *
+                                     SEARCH_RATE * SEND_PERIOD_SEC;
+                        search_ms += SEND_PERIOD_TICKS;
+                        searching  = true;
                     }
                 }
 #endif
