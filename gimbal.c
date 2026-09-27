@@ -46,7 +46,6 @@ static volatile bool              s_fb_ready;//主循环看到置true就拷贝 s
 
 volatile uint32_t g_gimbal_rx_count = 0u;
 volatile uint32_t g_gimbal_tx_fail  = 0u;
-volatile uint8_t  g_gimbal_tx[GIMBAL_TX_LEN] = {0};   /* 最近发出去的整帧, 调试用 */
 volatile uint32_t g_gimbal_timeout  = 0u;
 volatile uint32_t g_gimbal_rx_err   = 0u;
 volatile uint32_t g_gimbal_rx_bytes = 0u;
@@ -142,10 +141,6 @@ bool gimbal_send_cmd(uint8_t cmd, int16_t value)//cmd命令模式，后面为要
     buf[3] = (uint8_t) (((uint16_t) value >> 8) & 0xFFu);
     buf[4] = gimbal_crc8(buf, GIMBAL_TX_LEN - 1u);
 
-    for (i = 0u; i < GIMBAL_TX_LEN; i++) {
-        g_gimbal_tx[i] = buf[i];    /* 留一份, 调试行 TX= 打的就是它 */
-    }
-
     /* 丢掉可能残留的接收字节。一发一收下 IDLE 期间本不该有数据进来, 但万
      * 一上一轮超时后电机又慢吞吞回了半包, 那些字节会混进这次的反馈帧里,
      * 让 CRC 一直对不上。 */
@@ -179,27 +174,33 @@ bool gimbal_send_cmd(uint8_t cmd, int16_t value)//cmd命令模式，后面为要
     return true;
 }
 
-bool gimbal_set_speed(float rpm)
+bool gimbal_step_rad(float dtheta)
 {
-    if (rpm > (float) GIMBAL_RPM_MAX) {
-        rpm = (float) GIMBAL_RPM_MAX;
-    } else if (rpm < -(float) GIMBAL_RPM_MAX) {
-        rpm = -(float) GIMBAL_RPM_MAX;
+    if (dtheta > 6.28318530718f) {
+        dtheta = 6.28318530718f;
+    } else if (dtheta < -6.28318530718f) {
+        dtheta = -6.28318530718f;
     }
-    /* 协议里模拟量都是【定点数】, 满量程映到 32767:
-     *     角度 0x07:  θ   / (2π)  × 32767
-     *     速度 0x04:  rpm / 1000  × 32767     (1000 = limit.speed)
-     * ⚠️ 漏了这一步的话, 电机把 7 当成 7/32767×1000 = 0.2 rpm, 几乎不动 ——
-     *    表现就是"下了速度指令但云台不转"。
-     * ⚠️ 全程不取整: 1 LSB = 0.031 rpm = 0.18°/s, 比整数 rpm 细 33 倍。 */
-    return gimbal_send_cmd(GIMBAL_CMD_SPEED,
-                           (int16_t) (rpm / (float) GIMBAL_RPM_MAX *
+
+    /* raw = θ / (2π) × 32767, 与手册 0x05 的换算同构 */
+    return gimbal_send_cmd(GIMBAL_CMD_ANGLE_STEP,
+                           (int16_t) (dtheta / 6.28318530718f *
                                       GIMBAL_RAW_PER_TURN));
 }
 
 bool gimbal_enable(void)
 {
     return gimbal_send_cmd(GIMBAL_CMD_ENABLE, 0);
+}
+
+bool gimbal_disable(void)
+{
+    return gimbal_send_cmd(GIMBAL_CMD_DISABLE, 0);
+}
+
+bool gimbal_set_zero(void)//设置零点
+{
+    return gimbal_send_cmd(GIMBAL_CMD_SET_ZERO, 0);
 }
 
 bool gimbal_clear_error(void)//清除错误码
