@@ -69,6 +69,7 @@ err_x_px（原图像素，串口控制用）与 err_x_mm（靶面毫米，判 3c
 6. 验证毫米换算：靶纸水平平移 50mm，确认 err_x_mm 变化约 50mm
 """
 
+import os
 import time as pytime
 from struct import pack
 
@@ -76,11 +77,11 @@ import cv2
 import numpy as np
 
 try:  # 离线自测时不导入 maix
-    from maix import app, camera, display, image, pinmap, touchscreen, uart
+    from maix import app, camera, display, image, nn, pinmap, touchscreen, uart
     from maix import time as maix_time
 
     MAIX_AVAILABLE = True
-except ImportError:  # 在 PC 上跑 python camera_display.py <图片>
+except ImportError:  # 在 PC 上跑 python no_canny.py <图片>
     MAIX_AVAILABLE = False
 
 
@@ -428,6 +429,177 @@ def init_uart():
     except Exception as exc:
         print("UART 初始化失败，降级为无串口运行:", exc)
         return None
+
+
+# =============================================================================
+# §4.5 数字识别阶段 —— 上电先跑一次，跑完切回矩形识别
+# ---------------------------------------------------------------------------
+# 数字模型要 416x416 正方形输入，而矩形识别那套阈值全按 416x260 标定的，
+# 换分辨率就全部作废。所以这一段把相机切到 416x416，跑完再切回来。
+# =============================================================================
+
+DIGIT_MODEL_PATH_LOCAL = "model_320576.mud"
+DIGIT_MODEL_PATH_SYS = "/root/models/maixhub/320576/model_320576.mud"
+
+DIGIT_CAM_W = 416
+DIGIT_CAM_H = 416
+
+DIGIT_CONF_TH = 0.4         # MaixHub 示例用 0.5，放宽；误检交给连续帧确认去滤
+DIGIT_IOU_TH = 0.45
+
+# 连续多少帧都是同一个数字才认。单帧准确率 93.2%（模型报告里的 val_acc），
+# 连 5 帧能把误判压到千分之几。
+DIGIT_CONFIRM_N = 5
+
+# 认不出来就跑这么久然后放弃（给底盘发 0，让它知道没认出来）。
+# ⚠️ 不含下面 DIGIT_REPEAT_SECONDS 那一段。
+DIGIT_MAX_SECONDS = 10.0
+
+# 确认后往底盘重复发多久。**不需要反向 ACK** —— 发几十遍总有一遍能到，
+# 两边都只做单向，链路最少。
+DIGIT_REPEAT_SECONDS = 3.0
+DIGIT_SEND_HZ = 20.0
+
+# --- 第二路串口（发给底盘）---
+# 引脚按 MaixCAM2 Pins v1.0 引脚图：A30 = UART1_TX, A31 = UART1_RX
+# 设备名规律：UARTn -> /dev/ttySn（云台那路是 UART4 -> /dev/ttyS4）
+CHASSIS_UART_DEVICE = "/dev/ttyS1"
+CHASSIS_UART_TX_PIN = "A30"
+CHASSIS_UART_RX_PIN = "A31"
+CHASSIS_UART_BAUDRATE = 115200
+
+DIGIT_FRAME_HEADER = b"\xAA\x55"
+DIGIT_FRAME_CMD = 0x4E                  # 'N'
+
+
+def build_digit_frame(digit):
+    """5 字节帧：AA 55 'N' <digit> <checksum>，checksum = 前 4 字节之和 & 0xFF。
+
+    ⚠️ 这个格式要跟底盘那边对齐 —— 把这段发给负责底盘的人。
+        digit = 1~4 是识别到的数字；0 表示没认出来（超时）。
+    """
+    body = DIGIT_FRAME_HEADER + bytes((DIGIT_FRAME_CMD, int(digit) & 0xFF))
+    return body + bytes((sum(body) & 0xFF,))
+
+
+def init_uart_chassis():
+    """发给底盘的那路串口。失败返回 None，数字发不出去（不致命）。"""
+    if not MAIX_AVAILABLE:
+        return None
+    try:
+        pinmap.set_pin_function(CHASSIS_UART_TX_PIN, "UART1_TX")
+        pinmap.set_pin_function(CHASSIS_UART_RX_PIN, "UART1_RX")
+        return uart.UART(CHASSIS_UART_DEVICE, CHASSIS_UART_BAUDRATE)
+    except Exception as exc:
+        print("底盘串口初始化失败（数字发不出去）:", exc)
+        return None
+
+
+def _send_digit(dev, digit):
+    """往底盘重复发数字，持续 DIGIT_REPEAT_SECONDS 秒。"""
+    if dev is None:
+        print("底盘串口不可用，数字没发出去:", digit)
+        return
+    frame = build_digit_frame(digit)
+    n = max(1, int(DIGIT_REPEAT_SECONDS * DIGIT_SEND_HZ))
+    period = 1.0 / DIGIT_SEND_HZ
+    print("向底盘发送 N=%d，共 %d 次" % (digit, n))
+    for _ in range(n):
+        try:
+            dev.write(frame)
+        except Exception as exc:
+            print("底盘串口发送失败:", exc)
+            return
+        pytime.sleep(period)
+
+
+def _set_resolution(cam, w, h):
+    """切相机分辨率，并丢掉切换后 ISP 还没稳的那几帧。
+
+    帧率模式是创建 Camera 对象时按 (w, h, fps) 定的，两个阶段的分辨率都属于
+    同一档，所以创建后 set_resolution 够用 —— 若实测切完帧率不对，就得改成
+    销毁重建。
+    """
+    try:
+        cam.set_resolution(width=w, height=h)
+    except Exception as exc:
+        print("!! 切分辨率到 %dx%d 失败: %s" % (w, h, exc))
+        return False
+    try:
+        cam.skip_frames(30)
+    except Exception:
+        pass
+    return True
+
+
+def run_digit_phase(cam, chassis_dev):
+    """认数字。返回 1~4；认不出来返回 0。**跑完会把相机切回 CAM_W x CAM_H。**
+
+    ⚠️ 标签陷阱：模型的 labels 是 ["3", "1", "2", "4"]，不是顺序的 1~4。
+       所以必须用 detector.labels[class_id] 反查字符串再转 int，
+       **绝不能写 class_id + 1** —— 那会把 3 当成 1、4 当成 2，停错点位。
+    """
+    print("=== 阶段 1: 识别数字 ===")
+
+    if not _set_resolution(cam, DIGIT_CAM_W, DIGIT_CAM_H):
+        return 0
+
+    # 先试相对路径（模型跟应用打包在一起），不行再回退到系统目录
+    model_path = DIGIT_MODEL_PATH_LOCAL
+    if not os.path.exists(model_path):
+        model_path = DIGIT_MODEL_PATH_SYS
+    print("数字模型:", model_path, "存在" if os.path.exists(model_path) else "不存在!")
+
+    try:
+        detector = nn.YOLOv5(model=model_path)
+    except Exception as exc:
+        print("!! 数字模型加载失败，跳过识别:", exc)
+        _set_resolution(cam, CAM_W, CAM_H)
+        return 0
+
+    print("模型标签:", detector.labels)
+
+    last_digit = 0
+    same_count = 0
+    result = 0
+    t_start = pytime.time()
+
+    while not app.need_exit():
+        if pytime.time() - t_start > DIGIT_MAX_SECONDS:
+            print("!! 超时，没认出数字")
+            break
+
+        img = cam.read()
+        try:
+            objs = detector.detect(img, conf_th=DIGIT_CONF_TH, iou_th=DIGIT_IOU_TH)
+        except Exception as exc:
+            print("!! 检测失败:", exc)
+            break
+
+        digit = 0
+        if len(objs) > 0:
+            best = max(objs, key=lambda o: o.score)   # 取置信度最高的那个
+            try:
+                digit = int(detector.labels[best.class_id])
+            except Exception:
+                digit = 0
+
+        if digit in (1, 2, 3, 4):
+            same_count = same_count + 1 if digit == last_digit else 1
+        else:
+            same_count = 0
+        last_digit = digit
+
+        if same_count >= DIGIT_CONFIRM_N:
+            result = digit
+            print("确认数字 N = %d（连续 %d 帧）" % (digit, same_count))
+            break
+
+    _send_digit(chassis_dev, result)
+
+    _set_resolution(cam, CAM_W, CAM_H)
+    print("=== 阶段 2: 矩形识别瞄准 ===")
+    return result
 
 
 # =============================================================================
@@ -1429,8 +1601,9 @@ def init_camera():
     return cam
 
 
-def run_find_rects():
-    cam = init_camera()
+def run_find_rects(cam=None):
+    if cam is None:
+        cam = init_camera()     # 单独跑本文件时自己建; 两阶段流程用外面那个
     disp = display.Display()
     serial_dev = init_uart()  #先定义摄像头，串口
 
@@ -1587,7 +1760,7 @@ def run_find_rects():
 
 
 # =============================================================================
-# §9 离线自测 —— 在 PC 上跑：python camera_display.py <图片>
+# §9 离线自测 —— 在 PC 上跑：python no_canny.py <图片>
 #     用于不连板子先验证逆透视方向与靶心定位是否正确
 # =============================================================================
 
@@ -1693,4 +1866,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         _offline_test(sys.argv[1])
     else:
-        run_find_rects()
+        # 上电两阶段: 先认数字(内部切 416x416, 跑完切回), 再矩形识别瞄准
+        _cam = init_camera()
+        run_digit_phase(_cam, init_uart_chassis())
+        run_find_rects(_cam)
