@@ -181,7 +181,7 @@ CLOSE_KERNEL_SIZE = 5
 # 这道副作用由下面的 MIN_RING_OVERLAP 挡。
 # 想单独验证"断口到底该谁补"，可以临时改成 False 对比：关掉后黑框的断口会露出来。
 USE_CANNY = False
-CANNY_LOW = 70
+CANNY_LOW = 80
 CANNY_HIGH = 150
 
 # 轮廓"压在暗区上"的最低比例，用来挡掉 Canny 描出来的背景矩形。
@@ -225,7 +225,7 @@ THRESH_MODE = "fixed"
 #
 # ⚠️ 不要为了"让框闭合"去抬 T —— 抬 T 会让背景大量涌进来（这是反二值化，
 # 比 T 暗的算前景，T 越大进来的越多）。框断口应该交给 Canny 和闭运算补。
-FIXED_THRESHOLD = 110
+FIXED_THRESHOLD = 100
 
 # --- 初筛 ---
 # 最小轮廓面积(px^2)，416x260 下。
@@ -334,7 +334,7 @@ MIN_INNER_OUTER_RATIO = 0.68
 # 取 0.85 ⇒ 要求框宽 >= 约 10mm，比真靶纸的 18mm 让出 8mm；真值 0.728 到上限
 # 还有 0.122 间隙，够扛边缘模糊/透视/固定阈值带来的面积抖动（约 ±0.03~0.05）。
 # ⚠️ 和下限一样，只在"确实有内孔"(child_area >= MIN_AREA) 时才生效。0 表示关闭。
-MAX_INNER_OUTER_RATIO = 0.85
+MAX_INNER_OUTER_RATIO = 0.82
 
 # --- 靶纸物理尺寸与校正空间 ---
 # ⚠️ 这里填的必须是**算法实际锁定的那个四边形**的物理宽度，不是想当然的靶纸外沿。

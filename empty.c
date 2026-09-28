@@ -103,7 +103,8 @@
 #define AIM_GAIN_RATE           0.023f
 
 /* 像素焦距, px/rad。2026-09-28 实测 ≈290 (之前推算的 271 偏低 7%)。
- * 只用在速率前馈的换算上: 前馈要 x1(px/s) / f 才是真实角速度。
+ * ⚠️ 现在【没有任何地方消费它】—— 前馈砍掉视觉那一支之后就没人用了。
+ *    留着是因为它是实测值, 而且 AIM_GAIN_RATE 那段的 λ 推导要参考它。
  * 顺带: 水平视场 = 2·atan(208/290) ≈ 71°, 垂直 ≈ 48°。 */
 #define F_PX                    290.0f
 
@@ -111,16 +112,19 @@
  *
  * 补偿的是【积分器的速度误差】: yaw_ref 要以 ω 匀速涨, 就必须有恒定输入 ——
  *     dyaw_ref/dt = AIM_GAIN_RATE × err_x = ω   ⇒   err_x = ω / AIM_GAIN_RATE
- * 这个滞后【必须存在】, 否则 yaw_ref 涨不上去 ⇒ 云台永远落后靶心一截。
  * 把斜率直接喂进去, 它就不用靠误差去攒了。
  *
- * 前馈量 = ω_视线 = ω_云台 + d(err_x)/dt / f
- *                    └ 陀螺 ┘   └── 视觉 ──┘
- * 是【恒等式】(err_x = f·(θ靶−θ云台) 两边求导即得), 不含任何赛道模型:
- *   陀螺给绝对角速度, 视觉变化率给相对角速度, 合成视线的绝对角速度。
+ * 只前馈【云台自己的绝对角速度】(陀螺那一支)。完整的量是
+ *     ω_视线 = ω_云台 + d(err_x)/dt / f        (恒等式)
+ * 但第二支要过卡尔曼, 有 ~23 ms 滞后, 与即时的陀螺对不上 —— 抵消不完全就变成
+ * "滞后的微分"(负阻尼), 这正是以前取 1.0 会震的原因。所以砍掉它。
  *
- * 1.0 = 理论值。⚠️ 卡尔曼的 x1 有噪声和滞后, 实测有过冲就往下调 (0.7~0.8)。 */
-#define LOS_FF_GAIN             0.00
+ * 只留陀螺仍然够: 匀速绕圈时 d(err_x)/dt ≈ 0, 两支本来就相等。
+ *     ė_r = (G−1)·ω_云台 + K·err_x  ⇒  err_x = (1−G)·ω/K  ⇒ G=1 时稳态误差为 0
+ * ⚠️ 上限【严格】是 1.0 —— G>1 时 (G−1)·KP 变成正极点, 发散。
+ * ⚠️ GYRO_LSB_PER_DPS 错 X 倍等效于 G 要取 1/X, 这个旋钮正好吸收它。
+ * 起手 0.5, 往 1.0 调, 看到振就退。 */
+#define LOS_FF_GAIN             0.055
 
 /* 死区, 像素。
     卡尔曼滤波已经将err_x_f的抖动压在了亚像素级别，所以不需要很大的死区来抑制err_x_f的抖动
@@ -154,7 +158,7 @@
 /* 过程噪声。越大越信观测(跟得快、但噪声大)。
  * Q_POS 管误差, Q_RATE 管变化率 —— 变化率给大点, 让速度估计跟得上 */
 #define KF_Q_POS        0.5f
-#define KF_Q_RATE       100
+#define KF_Q_RATE       400
 
 /* 目标丢失超过这么久(ms)就复位滤波器, 免得重新捕获时旧状态造成跳变 */
 #define KF_RESET_MS     5000u
@@ -167,10 +171,10 @@
 #define SEARCH_ENABLE       1
 
 /* 扫描速率, rad/s ≈ 46°/s。 */
-#define SEARCH_RATE         0.80f
+#define SEARCH_RATE         0.70f
 
 /* 丢靶前误差小于这个就不搜 —— 靶纸就在附近(比如被人遮挡), 乱搜反而跑远 */
-#define SEARCH_MIN_ERR_PX   5.0f
+#define SEARCH_MIN_ERR_PX   0.0f
 
 /* 连续丢靶超过这么久(ms)才启动找靶。
  * ⚠️ 判据一律用【时间】不用帧数 
@@ -211,7 +215,7 @@
 #define GYRO_RATE_AXIS      2u
 
 /* 角度环 P, 单位 1/s。Kp=4 -> 时间常数 250 ms (远大于 10 ms 延迟, 安全) */
-#define YAW_KP              60.0f
+#define YAW_KP              40.0f
 
 /* 角度环 I, 单位 1/s²。消掉"车匀速转"时的稳态误差 —— 江南 Ki=0.8 同理 */
 #define YAW_KI              0
@@ -640,15 +644,12 @@ int main(void)
                     } else {
                         search_ms = 0;
                     }
-                    /* 速率前馈: 陀螺给绝对角速度, 卡尔曼的 x1/f 给相对角速度,
-                     * 合起来就是视线的绝对角速度 —— 见 LOS_FF_GAIN。
+                    /* 速率前馈: 只喂云台自己的绝对角速度 —— 见 LOS_FF_GAIN。
                      * ⚠️ 不受死区管 —— 它是速度项不是误差项, 误差进死区时它照样要顶。
                      * ⚠️ 必须判 rate_ok: 陀螺掉线时 yaw_rate_lpf 会【冻住】,
                      *    前馈拿着陈旧值一直往 yaw_ref 上加 -> 云台匀速转下去。 */
                     if (rate_ok) {
-                        yaw_ref += LOS_FF_GAIN *
-                                   (yaw_rate_lpf * DEG2RAD + s_kf_x1 / F_PX) *
-                                   SEND_PERIOD_SEC;
+                        yaw_ref += LOS_FF_GAIN * (yaw_rate_lpf * DEG2RAD) * SEND_PERIOD_SEC;
                     }
 
                     if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {

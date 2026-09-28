@@ -90,6 +90,18 @@ static void gyro_parse(void)
         g_gyro_rx_count++;
     } else if (len == 6u) {
         /* 模式 1: Yaw,Pitch,Roll —— ⚠️ 顺序与模式 0 不同, Yaw 在第一位 */
+        /* ⚠️ 收到这个长度说明模块【退回】仅姿态模式了(掉电/干扰)。两件事:
+         *   ① 清 s_mode_ok, 让 gyro_link_poll() 重新下发初始化命令拉回模式 0。
+         *      不清的话重试永久停止, 云台再也拿不到角速度。
+         *   ② gyro_raw 清零 —— 这一帧根本没带角速度, 留着的是上一次模式 0 的
+         *      陈旧值。冻结值会让阻尼项/前馈拿一个恒定的假角速度一直推, 云台
+         *      匀速转下去; 空数据安全得多。
+         * 航向(yaw_deg)照常能用, 所以这期间只是丢了阻尼/前馈, 不失自稳。 */
+        s_mode_ok = false;
+        s_msg.gyro_raw[0] = 0;
+        s_msg.gyro_raw[1] = 0;
+        s_msg.gyro_raw[2] = 0;
+
         s_msg.yaw_deg   = (float) (uint16_t)((uint16_t) s_buf[5] |
                                              ((uint16_t) s_buf[6] << 8)) / 100.0f;
         s_msg.pitch_deg = (float) (int16_t)((uint16_t) s_buf[7] |
