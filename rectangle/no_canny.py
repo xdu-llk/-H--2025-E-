@@ -165,7 +165,7 @@ ADAPTIVE_BLOCK_SIZE = 31        # 自适应阈值邻域边长，必须为奇数
 # 提到 18 后偏离从 42.8px 降到 8.1px，而干净背景的两张测试图结果一个像素没动。
 # 安全区间约 14~22；超过 26 开始漏检（靶框被判太严而断开）。
 # 现场调法：看屏幕上的 area —— 接近 160000（=512x320）说明背景混进来了，调大 C。
-ADAPTIVE_C = 70
+ADAPTIVE_C = 80
 # 闭运算核；0 或 1 表示关闭。作用是把阈值漏掉的断口跨接起来。
 # 实测 5 比 15 好：核太大反而会把东西糊到一起（杂乱背景那张照片上，
 # 15 的中心偏离 47.6px，5 只有 9.3px）。
@@ -327,6 +327,14 @@ MAX_FRAME_FILL = 0.30
 # 注意它只在"外框确实有内孔"时才能用（框断掉时外轮廓没有子轮廓，此时跳过检查）。
 # 0 表示关闭。
 MIN_INNER_OUTER_RATIO = 0.68
+
+# 内孔面积 / 外框面积 的**上限** —— 挡"框太细"的干扰：显示器边框、画框、打印的
+# 细线框。这类东西的比值接近 1，下限完全挡不住。同一个式子反算（框宽 t）：
+#     t=18mm(真靶纸) 0.728   t=12mm 0.814   t=10mm 0.844   t=5mm 0.920
+# 取 0.85 ⇒ 要求框宽 >= 约 10mm，比真靶纸的 18mm 让出 8mm；真值 0.728 到上限
+# 还有 0.122 间隙，够扛边缘模糊/透视/固定阈值带来的面积抖动（约 ±0.03~0.05）。
+# ⚠️ 和下限一样，只在"确实有内孔"(child_area >= MIN_AREA) 时才生效。0 表示关闭。
+MAX_INNER_OUTER_RATIO = 0.85
 
 # --- 靶纸物理尺寸与校正空间 ---
 # ⚠️ 这里填的必须是**算法实际锁定的那个四边形**的物理宽度，不是想当然的靶纸外沿。
@@ -933,14 +941,18 @@ def find_target_rect(combined, region=None):
                 continue
         nring += 1
 
-        # 内外轮廓互相印证：比值过低说明外框被背景污染撑大了（框粘连）。
+        # 内外轮廓互相印证：过低 = 外框被背景污染撑大了（框粘连）；
+        # 过高 = 框太细（显示器边框/画框类干扰）。
         # 只在"确实有内孔"时才能判；框断掉时外轮廓没有子轮廓，跳过。
-        if MIN_INNER_OUTER_RATIO > 0:
+        if (MIN_INNER_OUTER_RATIO > 0) or (MAX_INNER_OUTER_RATIO > 0):
             tc = pytime.perf_counter()
             child_area = largest_child_area(contours, hierarchy, idx)
             child_sec += pytime.perf_counter() - tc
             if child_area >= MIN_AREA:
-                if child_area / area < MIN_INNER_OUTER_RATIO:
+                io_ratio = child_area / area
+                if io_ratio < MIN_INNER_OUTER_RATIO:
+                    continue
+                if (MAX_INNER_OUTER_RATIO > 0) and (io_ratio > MAX_INNER_OUTER_RATIO):
                     continue
 
         frames.append({"idx": idx, "quad": quad, "area": area})
