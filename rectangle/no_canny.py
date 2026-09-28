@@ -69,7 +69,6 @@ err_x_px（原图像素，串口控制用）与 err_x_mm（靶面毫米，判 3c
 6. 验证毫米换算：靶纸水平平移 50mm，确认 err_x_mm 变化约 50mm
 """
 
-import os
 import time as pytime
 from struct import pack
 
@@ -77,7 +76,7 @@ import cv2
 import numpy as np
 
 try:  # 离线自测时不导入 maix
-    from maix import app, camera, display, image, nn, pinmap, touchscreen, uart
+    from maix import app, camera, display, image, pinmap, touchscreen, uart
     from maix import time as maix_time
 
     MAIX_AVAILABLE = True
@@ -165,7 +164,7 @@ ADAPTIVE_BLOCK_SIZE = 31        # 自适应阈值邻域边长，必须为奇数
 # 提到 18 后偏离从 42.8px 降到 8.1px，而干净背景的两张测试图结果一个像素没动。
 # 安全区间约 14~22；超过 26 开始漏检（靶框被判太严而断开）。
 # 现场调法：看屏幕上的 area —— 接近 160000（=512x320）说明背景混进来了，调大 C。
-ADAPTIVE_C = 80
+ADAPTIVE_C = 70
 # 闭运算核；0 或 1 表示关闭。作用是把阈值漏掉的断口跨接起来。
 # 实测 5 比 15 好：核太大反而会把东西糊到一起（杂乱背景那张照片上，
 # 15 的中心偏离 47.6px，5 只有 9.3px）。
@@ -180,7 +179,7 @@ CLOSE_KERNEL_SIZE = 5
 # 还可能更大，而选框规则是"取最大"，于是它们能顶掉靶纸（表现为画面跳变）。
 # 这道副作用由下面的 MIN_RING_OVERLAP 挡。
 # 想单独验证"断口到底该谁补"，可以临时改成 False 对比：关掉后黑框的断口会露出来。
-USE_CANNY = True
+USE_CANNY = False
 CANNY_LOW = 70
 CANNY_HIGH = 150
 
@@ -225,7 +224,7 @@ THRESH_MODE = "fixed"
 #
 # ⚠️ 不要为了"让框闭合"去抬 T —— 抬 T 会让背景大量涌进来（这是反二值化，
 # 比 T 暗的算前景，T 越大进来的越多）。框断口应该交给 Canny 和闭运算补。
-FIXED_THRESHOLD = 90
+FIXED_THRESHOLD = 110
 
 # --- 初筛 ---
 # 最小轮廓面积(px^2)，416x260 下。
@@ -343,15 +342,15 @@ MIN_INNER_OUTER_RATIO = 0.68
 TARGET_WIDTH_MM = 261.0
 TARGET_HEIGHT_MM = 174.0
 RECT_PX_PER_MM = 1.5
-RECT_W = int(TARGET_WIDTH_MM * RECT_PX_PER_MM)      # 391
-RECT_H = int(TARGET_HEIGHT_MM * RECT_PX_PER_MM)     # 261
+RECT_W = int(TARGET_WIDTH_MM * RECT_PX_PER_MM)      # 445
+RECT_H = int(TARGET_HEIGHT_MM * RECT_PX_PER_MM)     # 315
 MM_PER_PX_RECT = TARGET_WIDTH_MM / RECT_W           # 约 0.667 mm/px
 
 # --- 激光点（物理标定常量）---
 # err_x = 靶心 - 激光点。两者同号。
 LASER_X_PX = CAM_W / 2.0        # 默认取画面中心；标定后改成实测像素 x
 LASER_Y_PX = CAM_H / 2.0        # 仅用于绘制，竖直方向不参与控制
-ERR_X_SIGN = -1                 # 2026-09-21 实测反了（偏右时云台往顺时针转，正反馈），改成 -1
+ERR_X_SIGN = -1                  # 云台转向装反时改成 -1
 
 # --- 串口（沿用原有 6 字节协议，未改动）---
 UART_DEVICE = "/dev/ttyS4"
@@ -383,7 +382,7 @@ PROFILE_EVERY = 15              # 只用来定控制台那份的间隔（每 15*
 # 用这个开关，**不要去注释代码** —— 上次注释多了一行，把 show_img = img 也注掉，
 # 板子直接 UnboundLocalError 崩了。
 DRAW_RESULT = True
-DEBUG_TOUCH = False              # 触摸打点显示该点灰度与二值化判定
+DEBUG_TOUCH = False             # 触摸打点显示该点灰度与二值化判定
 DEBUG_BIN_BUTTON = False         # 右上角放一个按钮：点一下在"原图/二值图"之间切换
 BIN_BTN_W = 84                  # 按钮尺寸
 BIN_BTN_H = 26
@@ -432,259 +431,6 @@ def init_uart():
 
 
 # =============================================================================
-# §4.5 数字识别阶段（上电后先跑一次，之后不再用）
-# =============================================================================
-#
-# 流程：相机构建 416x416 -> 跑 YOLOv5 数字模型 -> 连续 N 帧同一个数字 -> 确认
-#       -> 通过第二路串口发给底盘 -> 切回 416x260 -> 进入瞄准阶段
-#
-# ⚠️ 为什么要切分辨率：
-#    ① YOLO 训练用的是【正方形】输入，矩形靶那套流程喂不进去；
-#    ② 瞄准用的矩形识别，那些阈值（MIN_AREA 等）全是按 416x260 标定出来的，
-#       换了分辨率全部作废。
-#    所以两个阶段各用各的分辨率，中间切一次。
-
-# --- 模型 ---
-# 两个候选路径，按顺序试：
-#   ① 相对路径 —— 模型跟 main.py 一起打包进应用时走这条（推荐）
-#   ② 系统路径 —— 模型单独拷到设备上时走这条（MaixHub 默认放这儿）
-# 打包应用时把 model_320576.mud 和两个 .axmodel 跟 main.py 放在同一层，
-# 就会命中 ①。
-DIGIT_MODEL_PATH_LOCAL = "model_320576.mud"
-DIGIT_MODEL_PATH_SYS = "/root/models/maixhub/320576/model_320576.mud"
-
-# --- 数字识别：瞄准循环里的【并行任务】，不再是独立阶段 ---
-# 流程: 瞄准稳定 -> 开数字识别 -> 认出 -> 发底盘 -> 关掉数字模型
-#       ⚠️ 全程【不切摄像头分辨率】
-DIGIT_CAM_W = 416           # 模型输入就是 416x416，必须正方形
-DIGIT_CAM_H = 416
-# 置信度阈值。MaixHub 示例用 0.5；放宽到 0.4 能多检出一些，误检交给下面的
-# "连续多帧确认"去滤。
-DIGIT_CONF_TH = 0.4
-DIGIT_IOU_TH = 0.45
-# 连续多少帧都是同一个数字才认。单帧准确率只有 93.2%（模型报告里 val_acc），
-# 连 5 帧能把误判压到千分之几。
-DIGIT_CONFIRM_N = 3
-
-# ⚠️ 模型要 416x416，而瞄准画面是 416x260 —— 居中裁 260x260 再缩放（方案 B）
-DIGIT_CROP_N = 260
-
-# ⚠️ 每 N 帧才跑一次数字推理。
-#    两个模型同时跑会掉帧率，而【认不出时要一直认】(车必须拿到数字才能停车)，
-#    所以必须降频，不能每帧跑。
-#    代价: 认出所需时间 = DIGIT_EVERY_N × DIGIT_CONFIRM_N 个瞄准帧。
-DIGIT_EVERY_N = 3
-
-# --- 什么时候开启数字识别 ---
-# 云台瞄准稳定后才开: 连续这么多帧 |err_x| 都在阈值内。
-# 阈值比主控那边的死区(2px)宽松一些, 容易达到。
-DIGIT_TRIGGER_PX = 5.0
-DIGIT_TRIGGER_N  = 10
-
-# 往底盘重复发数字多久(秒)。发几十遍总有一遍能到。
-DIGIT_REPEAT_SECONDS = 3.0
-DIGIT_SEND_HZ = 20.0
-
-# --- 第二路串口（发给底盘）---
-# 引脚按 MaixCAM2 Pins v1.0 引脚图：
-#     A30 = UART1_TX   A31 = UART1_RX
-# 设备名规律：UARTn -> /dev/ttySn（现有那路是 UART4 -> /dev/ttyS4）
-CHASSIS_UART_DEVICE = "/dev/ttyS1"      # UART1
-CHASSIS_UART_TX_PIN = "A30"             # UART1_TX -> 接底盘的 RX
-CHASSIS_UART_RX_PIN = "A31"             # UART1_RX <- 接底盘的 TX（只发不收，可不接）
-CHASSIS_UART_BAUDRATE = 115200
-
-DIGIT_FRAME_HEADER = b"\xAA\x55"
-DIGIT_FRAME_CMD = 0x4E                  # 'N' —— 我们发给底盘的数字帧
-DIGIT_ACK_CMD   = 0x41                  # 'A' —— 底盘收到后回这个(回显同一个 digit)
-
-
-def build_digit_frame(digit):
-    """组装 5 字节帧：AA 55 'N' <digit> <checksum>。
-
-    checksum = 前 4 字节之和 & 0xFF。
-
-    ⚠️ 这个格式要跟底盘那边对齐 —— 把这段发给负责底盘的人。
-        digit = 1~4 表示识别到的数字；0 表示没认出来（超时）。
-    """
-    body = DIGIT_FRAME_HEADER + bytes((DIGIT_FRAME_CMD, int(digit) & 0xFF))
-    return body + bytes((sum(body) & 0xFF,))
-
-
-def _set_resolution(cam, w, h):
-    """切相机分辨率，并丢掉切换后开头不稳定的帧。
-
-    MaixPy 有 set_resolution()，可以创建后再改，不必重建对象。
-    帧率模式是创建 Camera 对象时按 (w, h, fps) 定的，但我们两个阶段用的分辨率
-    都远小于 1280x720，属于同一档，所以够用 —— 若实测切完帧率不对，就得改成
-    销毁重建。
-    skip_frames 是官方 API，用来跳掉切换后 ISP 还没稳的那几帧。
-    """
-    try:
-        cam.set_resolution(width=w, height=h)
-    except Exception as exc:
-        print("!! 切分辨率到 %dx%d 失败: %s" % (w, h, exc))
-        return False
-    try:
-        cam.skip_frames(30)
-    except Exception:
-        pass
-    return True
-
-
-def init_uart_chassis():
-    """初始化发给底盘的那路串口。失败返回 None，数字就发不出去（不致命）。"""
-    if not MAIX_AVAILABLE:
-        return None
-    try:
-        pinmap.set_pin_function(CHASSIS_UART_TX_PIN, "UART1_TX")
-        pinmap.set_pin_function(CHASSIS_UART_RX_PIN, "UART1_RX")
-        return uart.UART(CHASSIS_UART_DEVICE, CHASSIS_UART_BAUDRATE)
-    except Exception as exc:
-        print("底盘串口初始化失败（数字发不出去）:", exc)
-        return None
-
-
-# ACK 可用性。一旦发现这个 MaixPy 的 UART 不支持读，就永久关掉，不再重试。
-_ACK_AVAILABLE = True
-
-
-def _wait_chassis_ack(dev, digit, timeout_s):
-    """在 timeout_s 内等底盘回的 ACK。收到返回 True。
-
-    ACK 格式: AA 55 'A' <digit> <checksum>  —— 底盘回显它收到的数字。
-
-    ⚠️ MaixPy 的 UART 没有 any()，读取只有 read(len, timeout)：
-           read()                   = read(-1, 0)，有数据立刻返回，没有返回 b''
-       所以这里用 read(len=-1, timeout=5) —— 最多阻塞 5ms，有数据马上返回。
-       一次轮询最多花 5ms，在 200ms 的发送周期里绰绰有余。
-    """
-    global _ACK_AVAILABLE
-    if not _ACK_AVAILABLE:
-        return False
-
-    t0 = pytime.time()
-    buf = b""
-    while pytime.time() - t0 < timeout_s:
-        try:
-            data = dev.read(len=-1, timeout=5)
-        except Exception as exc:
-            print("⚠️ 底盘串口读不了(%s)，关闭 ACK 等待" % exc)
-            _ACK_AVAILABLE = False
-            return False
-
-        if not data:
-            continue                    # 这一段没收到东西，接着轮询
-        buf += data
-
-        while len(buf) >= 5:
-            i = buf.find(DIGIT_FRAME_HEADER)
-            if i < 0:
-                buf = b""
-                break
-            if len(buf) - i < 5:
-                buf = buf[i:]
-                break
-            f = buf[i:i + 5]
-            buf = buf[i + 5:]
-            if (f[2] == DIGIT_ACK_CMD and f[3] == (digit & 0xFF)
-                    and (sum(f[:4]) & 0xFF) == f[4]):
-                return True
-    return False
-
-
-def send_digit(dev, digit):
-    """往底盘重复发数字。
-
-    收到 ACK 就提前结束；等不到也发够 DIGIT_REPEAT_SECONDS 就走，**不卡流程**。
-
-    ⚠️ 前向兼容：底盘即使还没实现 ACK，行为也和"只发不确认"完全一样。
-    """
-    if dev is None:
-        print("底盘串口不可用，数字没发出去:", digit)
-        return False
-
-    frame = build_digit_frame(digit)
-    n = max(1, int(DIGIT_REPEAT_SECONDS * DIGIT_SEND_HZ))
-    period = 1.0 / DIGIT_SEND_HZ
-    print("向底盘发送 N=%d，最多 %d 次" % (digit, n))
-
-    for k in range(n):
-        try:
-            dev.write(frame)
-        except Exception as exc:
-            print("底盘串口发送失败:", exc)
-            return False
-        if _wait_chassis_ack(dev, digit, period):
-            print("✅ 底盘已确认收到 N=%d（第 %d 次）" % (digit, k + 1))
-            return True
-
-    print("⚠️ 没等到底盘 ACK，已重复发 %d 次（底盘可能还没实现应答）" % n)
-    return False
-
-
-def load_digit_model():
-    """加载数字模型。失败返回 None —— 数字识别整个跳过，不影响瞄准。
-
-    ⚠️ 在【开机时】调，别等瞄准稳定了再调：模型 7.6MB，加载要好几秒，
-       放在主循环里会把云台卡住。
-    """
-    model_path = DIGIT_MODEL_PATH_LOCAL
-    if not os.path.exists(model_path):
-        model_path = DIGIT_MODEL_PATH_SYS
-    if not os.path.exists(model_path):
-        print("!! 数字模型不存在，跳过数字识别:", model_path)
-        return None
-    try:
-        detector = nn.YOLOv5(model=model_path)
-        print("数字模型已加载:", model_path, "标签:", detector.labels)
-        return detector
-    except Exception as exc:
-        print("!! 数字模型加载失败，跳过数字识别:", exc)
-        return None
-
-
-def crop_for_digit(frame_rgb):
-    """416x260 -> 居中裁 260x260 -> 缩放到 416x416 -> 转成 maix Image（方案 B）。
-
-    ⚠️ 只看画面中间那块。数字牌在画面边缘会看不到 —— 所以数字识别要等
-       【瞄准稳定】之后再开，那时靶纸已经在画面中心附近了。
-    ⚠️ 返回值必须是 maix Image，不能是 numpy：
-       YOLOv5.detect() 只收 Image，喂 numpy 会报
-       "incompatible function arguments"。
-    """
-    h, w = frame_rgb.shape[:2]
-    s = min(h, w, DIGIT_CROP_N)
-    x0 = (w - s) // 2
-    y0 = (h - s) // 2
-    crop = cv2.resize(frame_rgb[y0:y0 + s, x0:x0 + s], (DIGIT_CAM_W, DIGIT_CAM_H))
-    return image.cv2image(crop, bgr=False, copy=True)
-
-
-def detect_digit(detector, frame_rgb):
-    """在裁剪缩放后的图上跑一次 YOLO。返回 1~4；没检出/认不出返回 0。
-
-    ⚠️ 标签陷阱：模型的 labels 是 ["3", "1", "2", "4"]，不是顺序的 1~4。
-       所以必须用 detector.labels[class_id] 反查字符串再转 int，
-       **绝不能写 class_id + 1** —— 那会把 3 当成 1、4 当成 2，停错点位。
-    """
-    try:
-        objs = detector.detect(crop_for_digit(frame_rgb),
-                               conf_th=DIGIT_CONF_TH, iou_th=DIGIT_IOU_TH)
-    except Exception as exc:
-        print("!! 数字检测失败:", exc)
-        return 0
-    if len(objs) == 0:
-        return 0
-    best = max(objs, key=lambda o: o.score)      # 取置信度最高的那个
-    try:
-        d = int(detector.labels[best.class_id])
-    except Exception:
-        return 0
-    return d if d in (1, 2, 3, 4) else 0
-
-
-# =============================================================================
 # §5 视觉流水线 —— 纯 cv2/numpy，不依赖 maix，可在 PC 上单测
 # =============================================================================
 
@@ -694,13 +440,15 @@ def detect_digit(detector, frame_rgb):
 PROFILE_DATA = {
     "preprocess": 0.0, "find": 0.0, "homography": 0.0, "total": 0.0,
     "findcontours": 0.0, "approx": 0.0, "gates": 0.0,
+    # child = largest_child_area（循环内，每个候选一次）
+    # childq = _largest_child_quad（循环后，一次）—— 以前没被计时
+    "child": 0.0, "childq": 0.0,
     # contours = 轮廓总数；cand = 过了面积/周长门槛、真正开始走 8 道闸的候选数。
     # 帧率随场景波动很大（同一份参数能差好几倍），所以需要一个【跟场景无关】的
     # 指标来判断 MIN_AREA 到底挡掉了多少 —— 这两个数就是干这个的。
     "contours": 0, "cand": 0,
-    # digit = 数字模型单次推理耗时。它【不在】detect() 里 —— 数字识别是瞄准的
-    # 并行任务，只在跑 YOLO 的那些帧更新，是用来回答"开了数字模型掉多少帧"的。
-    "digit": 0.0,
+    # 漏斗：过面积/过周长/过贴合/过几何/过长宽比/过填充/过暗区 各剩几个
+    "funnel": (0, 0, 0, 0, 0, 0, 0),
 }
 
 
@@ -764,15 +512,21 @@ def preprocess(frame_rgb):
     if CLOSE_KERNEL_SIZE and CLOSE_KERNEL_SIZE >= 3:
         region = cv2.morphologyEx(region, cv2.MORPH_CLOSE, _get_kernel(CLOSE_KERNEL_SIZE))
 
-    # --- 通道 B：边界（哪里灰度跳变）---
+    # --- 通道 B：从【闭合后的二值图】取轮廓 ---
+    # ⚠️ Canny 的输入是 region（二值图），不是 blur（灰度图）。
+    # 在灰度图上取边会把背景的每一条纹理都描出来 —— 那些线围出一堆碎轮廓，
+    # 每个都要走一遍后面 8 道闸，实测杂乱场景能到 170 个。二值图上没有纹理，
+    # 只有"够黑的块"，取出来的边自然干净。
+    #
+    # 补断口是【闭运算】的活，不是 Canny 的 —— Canny 不改变白色的形状，
+    # 它只是把块描成一圈 1 像素的线。
     if USE_CANNY:
-        edges = cv2.Canny(blur, CANNY_LOW, CANNY_HIGH)
-        combined = cv2.bitwise_or(region, edges)   # 任一路说有就算有
+        combined = cv2.Canny(region, CANNY_LOW, CANNY_HIGH)
     else:
         combined = region
 
     # 返回两路：combined 用来找轮廓；region 留着给 find_target_rect 做
-    # "这个轮廓是不是压在暗区上"的检查（挡 Canny 描出来的背景矩形）
+    # "这个轮廓是不是压在暗区上"的检查
     return region, combined
 
 
@@ -948,14 +702,19 @@ def find_target_rect(combined, region=None):
     grown_region = None     # 真要判的时候才膨胀一次，见 ring_overlap_ratio
     frames = []
     approx_sec = 0.0        # 只累计 approximate_quad 自己的时间
+    child_sec = 0.0         # 只累计 largest_child_area 自己的时间
     n_cand = 0              # 过了面积+周长门槛、开始走后面 8 道闸的候选个数
+    # 各道闸过掉多少个（用来定位耗时：3 个贵操作各被调了几次）
+    na = np0 = nf = ng = nasp = nfill = nring = 0
     for idx, contour in enumerate(contours):
         area = cv2.contourArea(contour)
         if area < MIN_AREA:
             continue
+        na += 1                                     # arcLength 被调用的次数
         perimeter = cv2.arcLength(contour, True)
         if perimeter < MIN_PERIMETER:
             continue
+        np0 += 1                                    # minAreaRect 被调用的次数
 
         # 便宜的形状预筛 —— 插在 approximate_quad 之前。
         # 碎块在这里就被扔掉：后面的凸包、7 次 approxPolyDP、以及那 8 道闸
@@ -964,6 +723,7 @@ def find_target_rect(combined, region=None):
             continue
 
         n_cand += 1
+        nf += 1                                     # approximate_quad 被调用的次数
 
         ta = pytime.perf_counter()
         approx = approximate_quad(contour, perimeter, area)
@@ -974,6 +734,7 @@ def find_target_rect(combined, region=None):
         quad = approx.reshape(4, 2).astype(np.float32)
         if not check_rectangle_geometry(quad):
             continue
+        ng += 1
 
         _, _, w, h = cv2.boundingRect(approx)
         if h == 0:
@@ -981,10 +742,16 @@ def find_target_rect(combined, region=None):
         aspect = w / float(h)
         if aspect < MIN_ASPECT or aspect > MAX_ASPECT:
             continue
+        nasp += 1
 
-        # "是框不是块"的判据，见 frame_fill_ratio() 的说明
-        if frame_fill_ratio(contour, combined, scratch) > MAX_FRAME_FILL:
+        # "是框不是块"的判据，见 frame_fill_ratio() 的说明。
+        # ⚠️ 必须拿 region（真正的暗区）去测，不能拿 combined ——
+        # combined 是"Canny 描出来的一圈线"，那里实心块【中间是空的】，
+        # 看上去和一个中空的框一模一样，这道闸就废了（实测实心块会被误检）。
+        base = region if region is not None else combined
+        if frame_fill_ratio(contour, base, scratch) > MAX_FRAME_FILL:
             continue
+        nfill += 1
 
         # "这个框是压在暗区上的吗" —— 挡掉 Canny 描出来的背景矩形
         if region is not None and MIN_RING_OVERLAP > 0:
@@ -992,22 +759,28 @@ def find_target_rect(combined, region=None):
                 grown_region = cv2.dilate(region, _get_kernel(RING_GROW_SIZE))
             if ring_overlap_ratio(contour, grown_region, scratch) < MIN_RING_OVERLAP:
                 continue
+        nring += 1
 
         # 内外轮廓互相印证：比值过低说明外框被背景污染撑大了（框粘连）。
         # 只在"确实有内孔"时才能判；框断掉时外轮廓没有子轮廓，跳过。
         if MIN_INNER_OUTER_RATIO > 0:
+            tc = pytime.perf_counter()
             child_area = largest_child_area(contours, hierarchy, idx)
+            child_sec += pytime.perf_counter() - tc
             if child_area >= MIN_AREA:
                 if child_area / area < MIN_INNER_OUTER_RATIO:
                     continue
 
         frames.append({"idx": idx, "quad": quad, "area": area})
 
-    # find 拆账：循环总时间 = 拟合四边形 + 各道闸
+    # find 拆账：循环总时间 = 拟合四边形 + 找子轮廓 + 各道闸
     loop_ms = (pytime.perf_counter() - t_fc_end) * 1000.0
     PROFILE_DATA["approx"] = approx_sec * 1000.0
-    PROFILE_DATA["gates"] = loop_ms - PROFILE_DATA["approx"]
+    PROFILE_DATA["child"] = child_sec * 1000.0
+    PROFILE_DATA["gates"] = loop_ms - PROFILE_DATA["approx"] - PROFILE_DATA["child"]
     PROFILE_DATA["cand"] = n_cand
+    # 逐步漏斗：过面积 -> 过周长 -> 过贴合 -> 过几何 -> 过长宽比 -> 过填充 -> 过暗区
+    PROFILE_DATA["funnel"] = (na, np0, nf, ng, nasp, nfill, nring)
 
     if not frames:
         return None
@@ -1017,32 +790,50 @@ def find_target_rect(combined, region=None):
     # 干扰框（细边框画框、显示器边框）误当成靶纸。本题场景中靶纸是视野里的
     # 主导物体，取最大更稳。
     outer = max(frames, key=lambda r: r["area"])
+    # _largest_child_quad 在循环【之后】跑，以前完全没被计时 ——
+    # find 的耗时减去那三块之后剩下的那几毫秒，就是它。
+    tq = pytime.perf_counter()
+    inner = _largest_child_quad(contours, hierarchy, outer["idx"])
+    PROFILE_DATA["childq"] = (pytime.perf_counter() - tq) * 1000.0
     return (
         sort_corners(outer["quad"]),
-        _largest_child_quad(contours, hierarchy, outer["idx"]),
+        inner,
         outer["area"],
         "frame",
     )
 
 
+def _local_tile(contour, shape, pad):
+    """把轮廓裁到它自己的外接矩形（四周留 pad），并平移到局部坐标。
+
+    为什么必须裁：这两个函数原来都在【整幅图】上做 drawContours + bitwise_and +
+    countNonZero —— 每次调用要清零 108KB、再扫几遍整幅图。而设备实测这 6 次调用
+    （2 个候选 × 3 个函数）就吃掉 9ms。裁到外接矩形后，小候选的运算量能少几十倍。
+    结果完全一样，只是范围小了。
+    """
+    x, y, w, h = cv2.boundingRect(contour)
+    H, W = shape[:2]
+    x0 = max(0, x - pad); y0 = max(0, y - pad)
+    x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+    return (x0, y0, x1, y1), np.ascontiguousarray(contour - (x0, y0), dtype=np.int32)
+
+
 def frame_fill_ratio(contour, combined, scratch):
     """外框内部的前景占比。实心块接近 1，中空的框很小。
 
-    这是"是框不是块"的判据。**为什么不用父子轮廓面积比**：
-    靶纸内部的同心圆被自适应阈值判成前景后，闭合的圆环会把面板内部的黑区分割
-    成一圈圈窄环带，黑框的"内孔"于是被切碎，面积比远低于阈值而被误判为干扰
-    （实测真实靶纸照片直接掉到 outer-only，抗干扰完全失效）。
-    江南代码用固定阈值 35 + 锁曝光，红色圆环灰度约 150 进不了二值图，内孔保持
-    完整，所以父子面积比在那里成立；自适应阈值对局部对比度敏感，没有这个前提。
+    这是"是框不是块"的判据 —— 填充外轮廓后统计内部前景占比，与内孔是否被切碎无关。
 
-    填充外轮廓后统计内部前景占比，与内孔是否被切碎无关，因此更稳。
+    只在轮廓自己的外接矩形里算，见 _local_tile()。
     """
-    scratch[:] = 0
-    cv2.drawContours(scratch, [contour], -1, 255, thickness=cv2.FILLED)
-    inside = cv2.countNonZero(scratch)
+    (x0, y0, x1, y1), local = _local_tile(contour, combined.shape, 2)
+    tile = scratch[y0:y1, x0:x1]
+    tile[:] = 0
+    cv2.drawContours(tile, [local], -1, 255, thickness=cv2.FILLED)
+    inside = cv2.countNonZero(tile)
     if inside <= 0:
         return 1.0
-    foreground = cv2.countNonZero(cv2.bitwise_and(combined, scratch))
+    crop = np.ascontiguousarray(combined[y0:y1, x0:x1])
+    foreground = cv2.countNonZero(cv2.bitwise_and(crop, tile))
     return foreground / float(inside)
 
 
@@ -1062,13 +853,19 @@ def ring_overlap_ratio(contour, grown_region, scratch):
     结果完全一样，只是不再白做功。
     膨胀的理由：阈值通常只抓到黑框的一部分（反光处漏掉），膨胀一下才不会
     把框上没抓到的那些段误判成"不在暗区"。
+
+    只在轮廓自己的外接矩形里算，见 _local_tile()。线宽是 3，笔迹会超出
+    外接矩形 1 像素，所以 pad 取 3 兜住。
     """
-    scratch[:] = 0
-    cv2.drawContours(scratch, [contour], -1, 255, thickness=3)
-    ring = cv2.countNonZero(scratch)
+    (x0, y0, x1, y1), local = _local_tile(contour, grown_region.shape, 3)
+    tile = scratch[y0:y1, x0:x1]
+    tile[:] = 0
+    cv2.drawContours(tile, [local], -1, 255, thickness=3)
+    ring = cv2.countNonZero(tile)
     if ring <= 0:
         return 0.0
-    hit = cv2.countNonZero(cv2.bitwise_and(grown_region, scratch))
+    crop = np.ascontiguousarray(grown_region[y0:y1, x0:x1])
+    hit = cv2.countNonZero(cv2.bitwise_and(crop, tile))
     return hit / float(ring)
 
 
@@ -1255,7 +1052,8 @@ def _draw_cross(img, x, y, color, size=10, thickness=2):
 
 def draw_result(img, result):
     """把检测结果叠到 maix 图像上。"""
-    # 激光点始终画出来：它是物理标定的固定像素，是误差的基准
+    # 激光点始终画出来：它是物理标定的固定像素，是误差的基准。
+    # 放在 if 之前 —— 没找到靶纸时也画，屏幕上至少能看到"激光指着哪"。
     _draw_cross(img, LASER_X_PX, LASER_Y_PX, image.COLOR_YELLOW, size=10)
 
     if not result["found"]:
@@ -1631,30 +1429,13 @@ def init_camera():
     return cam
 
 
-def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
-    """主循环：矩形识别 + 瞄准。数字识别作为【并行任务】嵌在里面。
+def run_find_rects():
+    cam = init_camera()
+    disp = display.Display()
+    serial_dev = init_uart()  #先定义摄像头，串口
 
-    cam / disp / serial_dev / chassis_dev 都由调用方（main.py）建好传进来。
-
-    ⚠️ 摄像头分辨率全程保持 CAM_W x CAM_H（416x260），**一次都不切** ——
-       数字识别是对画面做居中裁剪，不动相机设置。
-
-    数字识别流程:
-        ① 瞄准稳定（连续 DIGIT_TRIGGER_N 帧 |err_x| 在阈值内）
-        ② -> 开启数字识别（每 DIGIT_EVERY_N 帧跑一次，降频省 CPU）
-        ③ -> 认出（连续 DIGIT_CONFIRM_N 次）-> 发底盘 -> 关掉数字模型
-    ⚠️ 认不出要一直认（车必须拿到数字才能停车），所以必须降频，不能每帧跑。
-    """
-    digit_model = load_digit_model()     # ★ 开机就加载, 别等瞄准稳定再加载(会卡几秒)
-    # ⚠️ 必须 False！crop_for_digit 只裁画面正中的 260x260, 靶纸没对准中心时
-    #    数字牌根本不在裁剪窗口里 —— 那样开多久都认不出。
-    #    置 False 才会走下面【阶段①: 等瞄准稳定】再开。
-    digit_on = False                     # 数字识别是否已开启
-    digit_done = False                   # 是否已经发过(发过就彻底关掉)
-    digit_ready = 0                      # 连续"瞄准好"的帧数
-    digit_last = 0                       # 上一次认出的数字
-    digit_same = 0                       # 连续相同次数
-    digit_skip = 0                       # 距上次推理过了几帧(降频用)
+    cv2.setUseOptimized(True)
+    cv2.setNumThreads(2)  # AX630C 双核  做视觉算法加速
 
     ts = None
     if DEBUG_TOUCH:
@@ -1700,39 +1481,6 @@ def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
             except Exception as exc:
                 print("串口发送失败:", exc)
                 serial_dev = None
-
-        # --- 数字识别：瞄准稳定后开启，认出后永久关闭 ---
-        # ⚠️ 这段和上面的瞄准完全独立 —— 无论它在不在跑，err_x 都照发。
-        if digit_model is not None and not digit_done:
-            if not digit_on:
-                # 阶段①：等瞄准稳定
-                if result["found"] and abs(result["err_x_px"]) < DIGIT_TRIGGER_PX:
-                    digit_ready += 1
-                else:
-                    digit_ready = 0
-                if digit_ready >= DIGIT_TRIGGER_N:
-                    digit_on = True
-                    print("✅ 瞄准稳定 -> 开启数字识别")
-            else:
-                # 阶段②：降频推理（认不出就一直认）
-                digit_skip += 1
-                if digit_skip >= DIGIT_EVERY_N:
-                    digit_skip = 0
-                    t_dig = pytime.perf_counter()
-                    d = detect_digit(digit_model, frame_rgb)
-                    PROFILE_DATA["digit"] = (pytime.perf_counter() - t_dig) * 1000.0
-                    if d:
-                        digit_same = digit_same + 1 if d == digit_last else 1
-                    else:
-                        digit_same = 0
-                    digit_last = d
-
-                    if digit_same >= DIGIT_CONFIRM_N:
-                        print("✅ 确认数字 N = %d（连续 %d 次）" % (d, digit_same))
-                        send_digit(chassis_dev, d)
-                        digit_model = None       # ★ 关掉，后面不再跑
-                        digit_done = True
-                        print("数字模型已关闭，继续纯瞄准")
 
         # --- 触摸：右上角按钮 / 打点取样 ---
         if ts is not None:
@@ -1808,8 +1556,8 @@ def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
         if PROFILE and frame_count % (PROFILE_EVERY * 10) == 0:
             print(
                 "[PROFILE] fps %.1f (周期 %.1fms) | detect %.1fms"
-                " = pre %.1f + find %.1f + h %.1f | 其余(取流+绘制+show+串口"
-                "，跑数字模型的那帧还含 YOLO) %.1fms   [maix_time.fps()=%.1f]"
+                " = pre %.1f + find %.1f + h %.1f | 取流+绘制+show+串口 %.1fms"
+                "   [maix_time.fps()=%.1f]"
                 % (
                     fps_real, loop_ms,
                     PROFILE_DATA["total"],
@@ -1818,41 +1566,24 @@ def run_aim_loop(cam, disp, serial_dev, chassis_dev=None):
                     fps_lib,
                 )
             )
-            if PROFILE_DATA["digit"] > 0.0:
-                print(
-                    "           数字模型 %.1fms/次，每 %d 帧跑 1 次"
-                    " -> 平均周期拉长约 %.1fms"
-                    % (PROFILE_DATA["digit"], DIGIT_EVERY_N,
-                       PROFILE_DATA["digit"] / DIGIT_EVERY_N)
-                )
             print(
-                "           find %.1fms 拆开 = 找轮廓 %.1f + 拟合四边形 %.1f"
-                " + 各道闸 %.1f | 轮廓 %d 个, 过门槛 %d 个"
+                "           find %.1fms = 找轮廓 %.1f + 拟合四边形 %.1f"
+                " + 找子轮廓 %.1f + 各道闸 %.1f + 选完之后 %.1f | 轮廓 %d 个, 过门槛 %d 个"
                 % (
                     PROFILE_DATA["find"], PROFILE_DATA["findcontours"],
-                    PROFILE_DATA["approx"], PROFILE_DATA["gates"],
+                    PROFILE_DATA["approx"], PROFILE_DATA["child"],
+                    PROFILE_DATA["gates"], PROFILE_DATA["childq"],
                     PROFILE_DATA["contours"], PROFILE_DATA["cand"],
                 )
             )
+            f = PROFILE_DATA["funnel"]
+            print(
+                "           漏斗: 面积%d -> 周长%d -> 贴合%d -> 几何%d"
+                " -> 长宽比%d -> 填充%d -> 暗区%d"
+                % f
+            )
 
     print("退出")
-
-
-def run_find_rects():
-    """兼容旧入口：初始化 -> 主循环。
-
-    ⚠️ 不再是"先认数字再瞄准"两个阶段了 —— 数字识别现在是瞄准循环里的
-       并行任务（瞄准稳定后自动开，认出后自动关），摄像头全程不切分辨率。
-    """
-    cv2.setUseOptimized(True)
-    cv2.setNumThreads(2)        # AX630C 双核，做视觉算法加速
-
-    cam = init_camera()
-    disp = display.Display()
-    serial_dev = init_uart()            # 发给云台主控（err_x）
-    chassis_dev = init_uart_chassis()   # 发给底盘（数字 N，只在认出时用一次）
-
-    run_aim_loop(cam, disp, serial_dev, chassis_dev)
 
 
 # =============================================================================

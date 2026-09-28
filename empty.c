@@ -1,41 +1,11 @@
-/*
- * Copyright (c) 2021, Texas Instruments Incorporated
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- *
- * *  Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- *
- * *  Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- *
- * *  Neither the name of Texas Instruments Incorporated nor the names of
- *    its contributors may be used to endorse or promote products derived
- *    from this software without specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
- * THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
- * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
- * EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
- * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
- * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+
 
 /*
  * 瞄准模块主程序 —— MSPM0G3507  (2025 电赛 E 题招新改编版)
  *
- *   职责: MaixCam2 --(UART3, 6字节帧)--> MSPM0 --(CAN, 1Mbps)--> QD4310 云台
- *         汇电籽-601 --(UART2)---------^  (角速度反馈 -> 速率环)
- *   靶面是一条竖直中线, 光斑高度不敏感, 所以只需一维(偏航)对准。
+ *   职责: MaixCam2 --(UART3, 6字节帧)--> MSPM0 --(UART1, 115200)--> QD4310 云台
+ *         汇电籽-601 --(UART2, 100Hz)--^  (角速度反馈 -> 航向环)
+ *   一维(偏航)对准。
  *   底盘(循迹/电机/定点停车)由另一块主控负责, 不在本程序范围内。
  *
  * 控制结构
@@ -48,9 +18,6 @@
  *   目标航向 (慢):  由视觉 err_x 累加而来 —— 决定"该朝哪看"。
  *
  *   角度环 (快):    把 yaw_total 拉到 yaw_ref, 带积分消掉稳态误差。
- *       ⚠️ 为什么不用纯速率环: 它要让 ω=0, 带宽必须高, 而 100 Hz 陀螺 +
- *          10 ms 延迟撑不住 —— 实测 K=0.15 就震。角度环只需"守住方向",
- *          带宽要求低得多, 这个延迟可以容忍。
  *
  *   阻尼:           陀螺角速度乘一个小系数抑制振铃。大了会自激。
  *
@@ -58,30 +25,7 @@
  * ---------------------------------------------------------------------------
  */
 
-/* ==========================================================================
- * ⚠️⚠️ 首次上电必做: 符号自检   (跳过这一步可能直接撞限位)
- * ---------------------------------------------------------------------------
- * 视觉外环的符号取决于【机械安装方向 + 电机正方向】, 在纸面上定不了, 是个
- * 掷硬币。推一遍物理:
- *
- *     云台俯视【逆时针】转  ->  相机往左看  ->  画面内容整体右移
- *     ->  center_x 变大  ->  err_x 变大
- *
- * 所以如果 QD4310 的"正转"在你的安装下就是俯视逆时针, 那么
- * "err_x > 0 就发正 Δθ" 构成【正反馈】—— 云台会一路跑到限位。
- *
- * 安全流程:
- *   1. 先把 AIM_GAIN_RATE 临时改小一个数量级 (例: 0.05 -> 0.005)
- *   2. 云台空载或手扶着, 上电
- *   3. 让靶纸出现在视野里, 盯调试串口的 E 字段, 看误差是【收敛】还是【发散】
- *   4. 发散 -> 把 MaixCam 侧 camera_display.py 里的 ERR_X_SIGN 改成 -1
- *      (改那边而不是改这里, 因为 ERR_X_SIGN 本来就是为这个准备的)
- *   5. 确认收敛后, 再把 AIM_GAIN_RATE 调回正常值
- *
- * ⚠️ 别一上来就用正常增益跑: 正反馈 + λ≈0.45, 几百毫秒就能撞限位。
- *
- * 陀螺速率环的符号同理, 见下面 GYRO_RATE_SIGN 的说明。
- * ========================================================================== */
+
 
 #include "ti_msp_dl_config.h"
 #include "debug_uart.h"
@@ -93,7 +37,7 @@
 
 /* 打开后每秒多打一行 UART1 收到的原始字节 (十六进制)。
  * 用于排查"云台反馈收不到"—— 详见 docs/BUGS.md #1。
- * 平时关着 (0), 免得刷屏。 */
+ */
 #define DEBUG_GIMBAL_SNOOP      0
 
 /* ==========================================================================
@@ -105,16 +49,7 @@
 #define LOOP_TICK_SEC           0.001f
 
 /* 发送周期。5 ms = 200 Hz。
- *
- * ⚠️ 2026-09-20 从 30 ms 缩到 5 ms, 为了消除"步进阻塞感":
- *    原来 33 Hz 发指令, 电机收到一个增量 -> 转过去 -> 停住 -> 等 28.6 ms
- *    再收下一个, 肉眼可见一顿一顿。
- *    拆细之后每秒转的总角度不变 (增益是速率形式), 但目标轨迹从 33 级台阶
- *    变成 200 级, 明显平滑。
- *
- * 代价: UART 负载 200 × 15 字节 = 3000 B/s, 115200 下约 26%。可接受。
  * 往返约 1.4 ms < 5 ms, 所以"一发一收"不会挡住这个节拍。
- *
  * 发送仍然是【事件驱动】优先 —— 收到新视觉帧立刻发; 这个周期是兜底, 负责
  * 视觉帧之间 (以及视觉断流时) 继续推进。 */
 #define SEND_PERIOD_TICKS       5u
@@ -125,11 +60,6 @@
 #define GYRO_LOST_TICKS         100u   /* 100 ms —— 陀螺上报率远高于此 */
 
 /* 云台健康检查开关 (基于反馈报文)。
- *
- * ⚠️ 现在设为 0 (关)。原因: 云台反馈收不到 (见 docs/BUGS.md #1), gim_lost 会
- *    一直涨, 于是每 300 ms 就重发一次"清错误 + 使能" —— 白白挤掉两条瞄准指令,
- *    还会反复给电机发使能。联调时会看到每 300 ms 抖一下, 容易误判成控制问题。
- *
  * 等反馈那个 bug 修好 (M 能正常涨) 之后, 改回 1 打开。 */
 #define GIMBAL_HEALTH_CHECK     0
 
@@ -137,22 +67,18 @@
  * 云台初始化/恢复序列
  * ---------------------------------------------------------------------------
  * UART 是【一发一收】的: 发出一条之后, 状态会停在"等反馈", 最长 10 ms 才
- * 超时放行。所以**两条指令不能背靠背发** —— 第二条必然被 gimbal_send_cmd
+ * 超时放行。 —— 第二条必然被 gimbal_send_cmd
  * 的"还在等反馈"挡掉, 而且不会报任何错。
- *
- * (CAN 版没这个问题: "发送缓冲忙" 60 µs 就清了, 中间隔 0.2 ms 就够。
- *  换 UART 之后那段逻辑直接失效 —— 表现就是电机的使能指令从来发不出去。)
- *
  * 所以拆成状态: 每拍只尝试推进【一步】, 发成功了才进下一步, 发不出去下拍再试。
  * ========================================================================== */
 #define GIM_STEP_IDLE       0u
 #define GIM_STEP_CLEAR      1u      /* 该发"清错误" */
 #define GIM_STEP_ENABLE     2u      /* 该发"使能" */
 
-/* 视觉掉线判定。MaixCam 约 35 fps (28.6 ms 一帧), 100 ms ≈ 连丢 3~4 帧。
+/* 视觉掉线判定。MaixCam 约 55 fps (18 ms 一帧), 100 ms ≈ 连丢 5~6 帧。
  * ⚠️ 必须有这一条: 没有它的话 vision_link_get() 一直返回 false 时, err_valid
  *    和 err_x 会保持上一次的值 —— 云台会拿着一个**陈旧的误差**继续转下去,
- *    直到撞限位。(云台和陀螺两路本来就有掉线检测, 只有视觉漏了。) */
+ */
 #define VISION_LOST_TICKS       100u
 
 #define DEG2RAD                 0.017453292519943295f
@@ -163,16 +89,18 @@
 
 /* 视觉外环增益, rad/(像素·秒):  Δθ = AIM_GAIN_RATE × err_x × dt
  *
- * ⚠️ 必须写成"速率"形式 —— 写成"每帧多少 rad"的话, 发送周期一改增益就变。
+ * dt是发送周期，所以每s的速率增加是相同的
  *
  * 取值反推自  AIM_GAIN_RATE = λ / (f · T_视觉):
- *     λ      每拍消掉多少误差。当前 0.29 —— >0.25 就开始有振铃
+ *     λ      每个视觉帧误差衰减的指数 = 环路穿越频率 ÷ 视觉帧率。
+ *            每帧消掉 1-e^(-λ)。>0.25 开始有振铃 (采样系统经验: 穿越频率
+ *            别超过采样率的 1/4)。当前 0.146, 余量只剩 1.7 倍 
  *     f      像素焦距 ≈ 271。**推算值**(OS04D10 按 416x260 居中裁剪), 没实测
- *     T_视觉 视觉帧周期 28.5 ms —— 是【视觉帧率】, 不是发送周期!
+ *     T_视觉 视觉帧周期 18 ms (55 fps) —— 是【视觉帧率】, 不是发送周期!
  *
  * ⚠️ f 错了环路增益就错。校验法: 靶纸水平平移 50mm @1m, err_x 应变化
  *    约 13.5 px。对不上就按实际比例改 f。 */
-#define AIM_GAIN_RATE           0.014f
+#define AIM_GAIN_RATE           0.020f
 
 /* 像素焦距, px/rad。⚠️ 推算值, 没实测 (OS04D10 按 416x260 居中裁剪)。
  * 只用在速率前馈的换算上: 前馈要 x1(px/s) / f 才是真实角速度。 */
@@ -191,20 +119,18 @@
  *   陀螺给绝对角速度, 视觉变化率给相对角速度, 合成视线的绝对角速度。
  *
  * 1.0 = 理论值。⚠️ 卡尔曼的 x1 有噪声和滞后, 实测有过冲就往下调 (0.7~0.8)。 */
-#define LOS_FF_GAIN             1.0f
+#define LOS_FF_GAIN             0
 
-/* 死区, 像素。err_x 是量化过的像素值, 零附近有 ±1~2 px 的抖动,
- * 不设死区的话积分器会追着噪声随机游走。
- * 2 px ≈ 0.38° (按 f=300), 在 1 m 处是 6.7 mm —— 远小于 3 cm 指标, 尽管取。
- * ⚠️ 死区只作用于**视觉项**; 速率项不受它影响 —— 云台被扰动就得压住, 跟视觉
- *    误差在不在死区里没关系。 */
-#define AIM_DEADBAND_PX         1.0f
+/* 死区, 像素。
+    卡尔曼滤波已经将err_x_f的抖动压在了亚像素级别，所以不需要很大的死区来抑制err_x_f的抖动
+    ，0.5在1m处对应2mm以内*/
+#define AIM_DEADBAND_PX         0.5f
 
-/* 转角速率上限, rad/s。重新捕获目标时 err_x 可能有几百像素, 不限速会甩一下。
- * 1.67 rad/s ≈ 95°/s, 既保护机械又不影响 2 s 内收敛。
+/* 转角速率上限
+ * 1.67 rad/s ≈ 95°/s
  * 注意它限的是**合成后**的总增量, 速率项也被一起限住 —— 速率项正常工作时量
  * 很小 (35°/s = 0.61 rad/s), 不会顶到这个上限。 */
-#define AIM_MAX_RATE_RAD_S       1.30f
+#define AIM_MAX_RATE_RAD_S       1.67f
 
 /* ==========================================================================
  * 视觉误差 2 态卡尔曼滤波
@@ -219,16 +145,15 @@
 
 /* 观测噪声方差 = σ²。
  * 实测靶纸静止时 err_x 在 ±3 px 跳 -> σ≈2 -> 理论上 R=4。
- * ⚠️ 但仿真发现 R=4 时滤波器【阶跃滞后 57 ms】(= 2 个视觉帧),
- *    是视觉追踪过冲的主要贡献者之一。
- *    降到 2.0 -> 滞后减半到 28 ms, 而峰值只从 11.0 涨到 10.8(几乎不变)。
- *    多出来的抖动由 AIM_DEADBAND_PX 兜住。 */
+ * ⚠️ R 越大滞后越大: k0 = a/(a+R) 就是"每帧采纳多少观测", R=4 时阶跃滞后 57 ms。
+ *    现在 R=1 + Q_RATE=100 -> 按稳态增益算 90% 约 23 ms (1.3 视觉帧), 过冲极小。
+ *    代价是残留抖动变大, 由 AIM_DEADBAND_PX(0.5) 兜住。 */
 #define KF_R            1.0f
 
 /* 过程噪声。越大越信观测(跟得快、但噪声大)。
  * Q_POS 管误差, Q_RATE 管变化率 —— 变化率给大点, 让速度估计跟得上 */
 #define KF_Q_POS        0.5f
-#define KF_Q_RATE       10.0f
+#define KF_Q_RATE       100
 
 /* 目标丢失超过这么久(ms)就复位滤波器, 免得重新捕获时旧状态造成跳变 */
 #define KF_RESET_MS     5000u
@@ -238,7 +163,7 @@
  * ========================================================================== */
 
 /* 找靶总开关。0 = 完全不找靶 (丢靶就守在当前朝向自稳, 云台不转)。 */
-#define SEARCH_ENABLE       0
+#define SEARCH_ENABLE       1
 
 /* 扫描速率, rad/s ≈ 46°/s。 */
 #define SEARCH_RATE         0.80f
@@ -247,25 +172,26 @@
 #define SEARCH_MIN_ERR_PX   5.0f
 
 /* 连续丢靶超过这么久(ms)才启动找靶。
- * ⚠️ 判据一律用【时间】不用帧数 —— 视觉帧率随场景变(同一份参数能差好几倍),
- *    帧数没有确定的时间含义。
+ * ⚠️ 判据一律用【时间】不用帧数 
  * ⚠️ 没它的话, 视觉单帧检测失败就立刻以 SEARCH_RATE(46°/s) 猛推 yaw_ref ——
  *    而视觉环在 err_x=10px 时本来只该推 0.1 rad/s, 差十几倍。
  *    于是: 检测一抖 -> 猛推 -> 冲过靶心 -> 反向再推 -> 停不下来。
- * 500 ms 的道理: 门槛没到时 yaw_ref 冻住, 航向环照常自稳 —— 等待期云台只是
- *    原地保持指向。而真丢靶后光扫一圈就要 8 s, 晚 500 ms 起步无所谓。 */
-#define SEARCH_LOST_MS      500u
+ * 200 ms 的道理: 门槛没到时 yaw_ref 冻住, 航向环照常自稳 —— 等待期云台只是
+ *    原地保持指向。而真丢靶后光扫一圈就要 8 s, 晚 200 ms 起步无所谓。 */
+#define SEARCH_LOST_MS      200u
 
 /* 一次找靶最多扫这么久。8 s × SEARCH_RATE(0.80 rad/s) = 6.4 rad ≈ 366°, 扫满一圈。 */
 #define SEARCH_MAX_MS       8000u
 
-/* 误差收进这个范围才算【真锁定】, 才允许重置扫描预算。
- * ⚠️ 不能用"看到靶"当条件: 扫描途中云台扫过靶会连续几十帧看到靶, 但那时
- *    err_x 还在几十~几百 px 摆动 —— 每次都重置的话 8 s 上限永远走不完。
- * ⇒ 预算只增不减 (除非真锁定), 所以扫描时间有【硬上限】。 */
+/* 误差收进 SEARCH_LOCK_PX 后, 还要【连续停留】这么久才算真锁定, 才允许重置
+ * 扫描预算。
+ * ⚠️ 只判"进过范围"不行: 云台扫过靶心时 err_x 必然从 +200 穿到 -200,
+ *    中途一定经过中心 —— 那一刻就重置的话扫描永远停不下来。
+ * ⚠️ 也不能用"看到靶"当条件: 扫过靶时云台会连续几十帧看到靶。 */
 #define SEARCH_LOCK_PX      20.0f
+#define SEARCH_LOCK_MS      300u
 
-/* 上电扫描方向。-1 = 反方向。
+/* 上电扫描方向。
  * ⚠️ 2026-09-27 实测: +1 扫的方向反了 (跑道上靶子在顺时针很小的角度内)。 */
 #define BOOT_SEARCH_DIR     (-1.0f)
 
@@ -284,7 +210,7 @@
 #define GYRO_RATE_AXIS      2u
 
 /* 角度环 P, 单位 1/s。Kp=4 -> 时间常数 250 ms (远大于 10 ms 延迟, 安全) */
-#define YAW_KP              4.0f
+#define YAW_KP              8.0f
 
 /* 角度环 I, 单位 1/s²。消掉"车匀速转"时的稳态误差 —— 江南 Ki=0.8 同理 */
 #define YAW_KI              0
@@ -294,21 +220,22 @@
 
 /* 阻尼系数 (原来的 GYRO_RATE_K)。只做阻尼, 别大。
  * ⚠️ 实测: 纯速率环时 0.3 震 / 0.15 轻微震 / 0 不震 */
-#define YAW_KD              0.1
+#define YAW_KD              0
 
-/* 陀螺速率项符号 (阻尼用)。反了会"车一转云台就朝同方向猛甩"。
- * ⚠️ 和速率环版的 RATE_SIGN 是同一个物理量, 那版实测 -1.0f 是对的。 */
-#define GYRO_RATE_SIGN      (-1.0f)
+//正确参数
+#define GYRO_RATE_SIGN      (-1.0f)  
 
-/* 模块 Yaw 与 GyroZ 符号相反, 累加时翻一下。
- * ⚠️ 2026-09-27: 试过 +1, 云台一直转不停, 说明这个方向才是对的。 */
+
 #define YAW_SIGN            (-1.0f)
 
 /* 阶段开关: 1 = 只测自稳(yaw_ref 固定, 不接视觉) / 0 = 接视觉
  * 先跑 1, 确认"手转车身云台能守住方向", 再改 0 */
 #define YAW_HOLD_ONLY       0
 
-/* 一阶低通, 每陀螺帧一次。1.0 = 关闭 (滤波会加滞后, 先别开) */
+/* 一阶低通, 每陀螺帧一次 (100 Hz)。1.0 = 关闭。
+ * ⚠️ 0.9 的截止频率 ≈ 45 Hz, 逼近奈奎斯特 (50 Hz), 基本等于没滤。
+ *    阻尼项和前馈都用它, 要真滤噪得降到 0.3~0.5 (约 6~11 Hz),
+ *    代价是给这两项都加滞后。 */
 #define GYRO_LPF_ALPHA      1.0f
 
 /* ==========================================================================
@@ -475,6 +402,7 @@ int main(void)
     float    err_x     = 0.0f;   /* 原始误差 (调试用) */
     float    err_x_f   = 0.0f;   /* 卡尔曼滤波后的误差 —— 控制用这个 */
     uint16_t lost_ms   = 0;      /* 距上次看到靶过了多少 ms (找靶和卡尔曼复位的判据) */
+    uint16_t lock_ms   = 0;      /* 误差在锁定范围内连续停留了多少 ms */
     bool     err_valid = false;
 
     /* --- 找靶 --- */
@@ -482,6 +410,7 @@ int main(void)
     uint16_t search_ms   = 0;    /* 本次找靶已经扫了多少 ms */
     bool     ever_seen   = false;/* 曾经识别到过靶纸吗 —— 区分上电找靶/丢靶找靶 */
     bool     searching   = false;/* 上一拍真推过 yaw_ref? 认回靶时要拉平 */
+    bool     gyro_was_ok = false;/* 上一拍陀螺有效? 用来抓"刚上线"那一拍 */
     float    yaw_rate  = 0.0f;  /* °/s */
     float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
     float    yaw_total  = 0.0f;   /* IMU 连续航向 (rad), 由回绕累加得到 */
@@ -522,7 +451,7 @@ int main(void)
              * 帧间隔异常(丢帧/启动)时退回标称值, 免得速度估计被带偏。 */
             float dt_vis = (float) vis_lost * LOOP_TICK_SEC;
             if (dt_vis < 0.005f || dt_vis > 0.2f) {
-                dt_vis = 0.0285f;
+                dt_vis = 0.018f;
             }
 #if DEBUG_PRINT_ENABLE
             /* 用【上一次】的 vis_lost 当帧间隔 —— 它就是"距上一帧过了多少 ms"。
@@ -536,8 +465,12 @@ int main(void)
             need_send = true;       /* 有新帧 -> 这一拍立刻发出去 */
             if (vmsg.status == VISION_STATUS_TARGET_VALID) {
                 err_x = (float) vmsg.err_x;      /* 原始值, 调试用 */
-                if (lost_ms >= KF_RESET_MS) {
-                    vision_filter_reset();       /* 丢太久, 重新捕获 -> 复位 */
+                /* 重新捕获就复位 —— 两种情况:
+                 *   ① 丢了很久 (KF_RESET_MS)
+                 *   ② 搜索真推过 yaw_ref: 云台已扫走几十度, 像素系的旧状态无意义
+                 * 不复位的话, 重捕获那一帧的新息巨大, 会给 x1 一大脚 -> 甩一下。 */
+                if (searching || (lost_ms >= KF_RESET_MS)) {
+                    vision_filter_reset();
                 }
                 err_x_f   = vision_filter(err_x, dt_vis);   /* 滤波后, 控制用 */
                 err_valid = true;
@@ -562,6 +495,16 @@ int main(void)
             lost_ms = 0;
         } else if (lost_ms < 0xFFFFu) {
             lost_ms++;
+        }
+
+        /* 在锁定范围内连续停留了多久 —— 判"真锁定", 见 SEARCH_LOCK_MS */
+        if (err_valid &&
+            (err_x_f > -SEARCH_LOCK_PX) && (err_x_f < SEARCH_LOCK_PX)) {
+            if (lock_ms < 0xFFFFu) {
+                lock_ms++;
+            }
+        } else {
+            lock_ms = 0;
         }
 
         /* --- 陀螺 --- */
@@ -634,14 +577,12 @@ int main(void)
 
         /* --- 发送: 事件驱动 + 定时兜底 ---
          *
-         * 原来纯定时 (30 ms) 发, 视觉帧 28.6 ms 一帧, 两个周期很接近但不相等,
-         * 于是 err_x 从"到达"到"发出去"的等待时间在 0~28.6 ms 之间飘 (平均
-         * 约 14 ms), 再叠加发送本身的零阶保持 (平均 15 ms) —— 相当于给环路
-         * **额外加了约 30 ms 延迟**, 把相位裕度吃掉一大半。
+         * 纯定时发的话, err_x 从"到达"到"发出去"要白等一个发送周期 (平均半个),
+         * 再叠加发送本身的零阶保持 —— 相当于给环路凭空加一段延迟。
          *
-         * 改成收到新帧就立刻发之后, 这一项延迟降到 0~1 ms (主循环 1 ms 节拍)。
-         * send_tick 只在没有新帧时才有机会累加, 所以视觉正常时定时分支根本
-         * 不会触发, 它纯粹是视觉断流时的保活。 */
+         * 改成收到新帧就立刻发之后, 这一项降到 0~1 ms (主循环 1 ms 节拍)。
+         * send_tick 只在没有新帧时才累加 (need_send 为真时短路跳过), 所以视觉
+         * 正常 (55 fps) 时定时分支根本不会触发, 它纯粹是视觉断流时的保活。 */
         if (need_send || (++send_tick >= SEND_PERIOD_TICKS)) {
             send_tick = 0;
             need_send = false;
@@ -663,6 +604,16 @@ int main(void)
                  *    这期间 vis_lost 一路涨 —— 不在线就绝不找靶, 免得盲扫。 */
                 bool vis_ok  = (vis_lost  < VISION_LOST_TICKS);
 
+                /* 陀螺刚上线: yaw_total 才从 0 起算, 而 yaw_ref 是掉线期间由
+                 * 视觉积分器自己攒的 —— 两者从来没对齐过。不拉平的话
+                 * e = yaw_ref 就是几十度, 航向环一接手就把云台甩到别处去。
+                 * (掉线期间 aim_step 走纯视觉兜底, 压根不看 yaw_total。) */
+                if (rate_ok && !gyro_was_ok) {
+                    yaw_ref   = yaw_total;
+                    searching = false;
+                }
+                gyro_was_ok = rate_ok;
+
 #if !YAW_HOLD_ONLY
                 /* --- 阶段 2: 视觉驱动目标航向 ---
                  * 看到靶 -> 立刻停搜索, 用【滤波后】的误差累加 yaw_ref。 */
@@ -677,17 +628,30 @@ int main(void)
                         yaw_ref   = yaw_total;
                         searching = false;
                     }
-                    /* 真锁定了才重置扫描预算。扫过靶不算 (那时 err_x 还很大),
-                     * 否则预算被反复清零, 8 s 上限永远走不完。 */
-                    if ((err_x_f > -SEARCH_LOCK_PX) && (err_x_f < SEARCH_LOCK_PX)) {
+                    /* 真锁定 (在范围内连续停留够久) 才重置扫描预算 —— 见 SEARCH_LOCK_MS */
+                    if (lock_ms >= SEARCH_LOCK_MS) {
+                        search_ms = 0;
+                    } else if (search_ms > SEND_PERIOD_TICKS) {
+                        /* 看到靶就退额度, 速率与累积对齐 (本块已在 if (err_valid) 里)。
+                         * 没有这条的话, 瞄准误差一直卡在 SEARCH_LOCK_PX 外面时
+                         * 只扣不回, 8000 耗尽后【永远不再扫】。 */
+                        search_ms -= SEND_PERIOD_TICKS;
+                    } else {
                         search_ms = 0;
                     }
+                    /* 速率前馈: 陀螺给绝对角速度, 卡尔曼的 x1/f 给相对角速度,
+                     * 合起来就是视线的绝对角速度 —— 见 LOS_FF_GAIN。
+                     * ⚠️ 不受死区管 —— 它是速度项不是误差项, 误差进死区时它照样要顶。
+                     * ⚠️ 必须判 rate_ok: 陀螺掉线时 yaw_rate_lpf 会【冻住】,
+                     *    前馈拿着陈旧值一直往 yaw_ref 上加 -> 云台匀速转下去。 */
+                    if (rate_ok) {
+                        yaw_ref += LOS_FF_GAIN *
+                                   (yaw_rate_lpf * DEG2RAD + s_kf_x1 / F_PX) *
+                                   SEND_PERIOD_SEC;
+                    }
+
                     if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {
-                        /* 速率前馈: 陀螺给绝对角速度, 卡尔曼的 x1/f 给相对角速度,
-                         * 合起来就是视线的绝对角速度 —— 见 LOS_FF_GAIN。 */
-                        float w_los = yaw_rate_lpf * DEG2RAD + s_kf_x1 / F_PX;
-                        yaw_ref += (AIM_GAIN_RATE * err_x_f +
-                                    LOS_FF_GAIN * w_los) * SEND_PERIOD_SEC;
+                        yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
                     }
                 }
 
@@ -731,9 +695,11 @@ int main(void)
          * debug_uart.h 里的 DEBUG_PRINT_ENABLE 改成 0 (详见该文件说明)。
          *
          *   V  视觉帧数    —— 不涨 = MaixCam 没发 / UART3 接线错
+         *      vc/vo 校验错/溢出次数, vg 本周期最大帧间隔 (ms, 抓帧率抖动)
          *   G  陀螺帧数    —— 不涨 = 陀螺没发 / UART2 接线错
-         *   M  云台反馈数  —— 不涨 = CAN 没通 / 云台没使能
-         *   BO Bus-Off 次数—— 不为 0 = CAN 接线、终端电阻、或收发器 TX/RX 接反
+         *   M  云台反馈数  —— 不涨 = UART1 接线 / 云台没使能
+         *      TO 反馈超时, ME 帧错, RB 收到的原始字节数
+         *      (RB 恒为 0 才是硬件问题; RB 在涨但 M=0 是协议问题)
          *   E  当前 err_x (像素, 原始)     Ef 滤波后 —— 控制用的是 Ef
          *      两者对比就能看出卡尔曼压掉了多少抖动
          *   R  当前偏航角速度 (°/s) —— ⚠️ 打印的是 ×10 的值 (R=35 表示 3.5°/s)
