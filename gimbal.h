@@ -49,8 +49,8 @@
 #define GIMBAL_CMD_ENABLE       0x01u
 #define GIMBAL_CMD_DISABLE      0x02u
 #define GIMBAL_CMD_CURRENT      0x03u   /* int16, -10 ~ 10 A */
-#define GIMBAL_CMD_SPEED        0x04u   /* int16, -1000 ~ 1000 rpm */
-#define GIMBAL_CMD_ANGLE        0x05u   /* uint16, 0 ~ 2π rad (绝对) */
+#define GIMBAL_CMD_SPEED        0x04u   /* int16, ±32767 对应 ±1000 rpm */
+#define GIMBAL_CMD_ANGLE        0x05u   /* uint16, 0~2π rad (绝对), 满量程 65535 */
 #define GIMBAL_CMD_LOW_SPEED    0x06u
 #define GIMBAL_CMD_ANGLE_STEP   0x07u   /* int16, -2π ~ 2π rad (增量) */
 #define GIMBAL_CMD_CLEAR_ERROR  0xFBu   /* 需固件 > 6.2.2, 本机 6.4.0 OK */
@@ -81,8 +81,15 @@ typedef struct {
     uint16_t angle_raw;     /* 0~65535 对应 0~2π rad */
 } gimbal_feedback_t;
 
-/* 2π rad 对应的原始码值 */
+/* 2π rad 对应的原始码值 (0x07 / 反馈的 speed/current 都用这个满量程) */
 #define GIMBAL_RAW_PER_TURN     32767.0f
+
+/* ⚠️ 0x05 角度控制是【uint16】, 满量程是 65535 而不是 32767, 别混。
+ * 手册 5.3.2.1: 0.5 rad -> 0.5/(2π)×65535 = 5218 */
+#define GIMBAL_ANGLE_FULL       65535.0f
+
+/* 速度满量程 (手册 limit.speed) */
+#define GIMBAL_RPM_MAX          1000.0f
 
 /* 换算工具 (仅供显示/调试) */
 static inline float gimbal_angle_rad(uint16_t raw)
@@ -111,9 +118,15 @@ void gimbal_poll(void);
  * 或者 UART 发不出去(异常)。 */
 bool gimbal_send_cmd(uint8_t cmd, int16_t value);
 
-/* 角度步进 (指令 0x07)。dtheta 单位 rad, 内部按 -2π~2π 夹紧。
- * 这是视觉外环 -> 云台的唯一入口。 */
-bool gimbal_step_rad(float dtheta);
+/* 速度指令 (0x04)。rpm 是真实转速, 内部按 rpm/1000 × 32767 缩放。
+ * ⚠️ 用 float: 取整推迟到缩放之后, 低速分辨率才够 (1 LSB = 0.18°/s)。
+ * ⚠️ 这是【转子相对定子】的速度, 定子固定在车架上。 */
+bool gimbal_set_speed(float rpm);
+
+/* 绝对角度 (0x05)。rad 内部归一到 [0, 2π), 编码 θ/(2π) × 65535。
+ * ⚠️ 满量程和 0x07 的 32767 【不同】—— 手册 5.3.2.1 明确写的是 uint16/65535。
+ * ⚠️ 是电机【自己零点】的绝对角, 不是世界系。零点由 0xFE 设。 */
+bool gimbal_set_angle(float rad);
 
 bool gimbal_enable(void);
 bool gimbal_disable(void);

@@ -22,7 +22,7 @@
  * 帧就永远攒不齐 (表现为 g_gimbal_rx_bytes 在涨、而 M 和 ME 都是 0)。
  *
  * ⚠️ 不能大于发送周期, 否则发不出下一条。改 SEND_PERIOD_TICKS 时这里要跟着改。 */
-#define GIMBAL_RX_TIMEOUT_TICKS  5u //现在是5ms和发送周期一致
+#define GIMBAL_RX_TIMEOUT_TICKS  4u //和发送周期一致 (empty.c 的 SEND_PERIOD_TICKS)
 
 /* TX FIFO 满时的自旋上限, 防止 UART 时钟异常把主循环卡死 */
 #define GIMBAL_TX_GUARD      200000u
@@ -174,18 +174,35 @@ bool gimbal_send_cmd(uint8_t cmd, int16_t value)//cmd命令模式，后面为要
     return true;
 }
 
-bool gimbal_step_rad(float dtheta)
+bool gimbal_set_speed(float rpm)
 {
-    if (dtheta > 6.28318530718f) {
-        dtheta = 6.28318530718f;
-    } else if (dtheta < -6.28318530718f) {
-        dtheta = -6.28318530718f;
+    if (rpm > GIMBAL_RPM_MAX) {
+        rpm = GIMBAL_RPM_MAX;
+    } else if (rpm < -GIMBAL_RPM_MAX) {
+        rpm = -GIMBAL_RPM_MAX;
     }
 
-    /* raw = θ / (2π) × 32767, 与手册 0x05 的换算同构 */
-    return gimbal_send_cmd(GIMBAL_CMD_ANGLE_STEP,
-                           (int16_t) (dtheta / 6.28318530718f *
-                                      GIMBAL_RAW_PER_TURN));
+    /* raw = rpm/1000 × 32767。和 0x07 的 θ/2π×32767 不可互换 */
+    return gimbal_send_cmd(GIMBAL_CMD_SPEED,
+                           (int16_t) (rpm / GIMBAL_RPM_MAX * GIMBAL_RAW_PER_TURN));
+}
+
+bool gimbal_set_angle(float rad)
+{
+    /* 归一到 [0, 2π) */
+    while (rad < 0.0f) {
+        rad += 6.28318530718f;
+    }
+    while (rad >= 6.28318530718f) {
+        rad -= 6.28318530718f;
+    }
+
+    /* ⚠️ 0x05 是【uint16】, 满量程 65535 —— 和 0x07 的 int16/32767 不一样!
+     * (手册 5.3.2.1: 0.5 rad -> 0.5/(2π)×65535 = 5218)
+     * gimbal_send_cmd 收 int16_t, 但字节是原样拆的, 高位不会丢。 */
+    return gimbal_send_cmd(GIMBAL_CMD_ANGLE,
+                           (int16_t) (uint16_t) (rad / 6.28318530718f *
+                                                 GIMBAL_ANGLE_FULL));
 }
 
 bool gimbal_enable(void)

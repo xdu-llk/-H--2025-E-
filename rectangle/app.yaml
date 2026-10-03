@@ -1,0 +1,12 @@
+id: zhaoxin
+name: 10.3zhaoxin
+version: 1.0.0
+author: jiojio
+icon: ''
+desc: nocanny
+files:
+  - main.py
+  - model_320576_npu.axmodel
+  - model_320576_vnpu.axmodel
+  - model_320576.mud
+  - no_canny.py

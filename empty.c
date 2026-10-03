@@ -4,24 +4,19 @@
  * 瞄准模块主程序 —— MSPM0G3507  (2025 电赛 E 题招新改编版)
  *
  *   职责: MaixCam2 --(UART3, 6字节帧)--> MSPM0 --(UART1, 115200)--> QD4310 云台
- *         汇电籽-601 --(UART2, 100Hz)--^  (角速度反馈 -> 航向环)
- *   一维(偏航)对准。
- *   底盘(循迹/电机/定点停车)由另一块主控负责, 不在本程序范围内。
+ *         汇电籽-601 --(UART2, 100Hz)--^  (装在【车体】上, 测车体偏航角)
+ *   一维(偏航)对准。底盘(循迹/电机)由另一块主控负责。
  *
- * 控制结构
+ * 控制结构 —— 云台【开环】, 没有任何云台角度反馈
  * ---------------------------------------------------------------------------
- *   云台内部自带角度环, 主控在外面再套一层【航向环】, 增量式发指令:
+ *     速度指令(0x04) = 几何前馈 + 视觉 P      两路都是 rad/s, 直接相加
  *
- *       目标航向 yaw_ref ──→ 角度环 PI ──→ 目标角速度 w ──阻尼──→ Δθ
- *                              ↑ 反馈 = IMU 连续航向 yaw_total
+ *   几何前馈: 陀螺测车体偏航角 psi -> 反推车在弧上的位置 -> 靶的方位角
+ *             变化率。见 guidance.h。
+ *   视觉 P:   只管静态残差, 越靠近靶心速度越小。
  *
- *   目标航向 (慢):  由视觉 err_x 累加而来 —— 决定"该朝哪看"。
- *
- *   角度环 (快):    把 yaw_total 拉到 yaw_ref, 带积分消掉稳态误差。
- *
- *   阻尼:           陀螺角速度乘一个小系数抑制振铃。大了会自激。
- *
- *   详见 docs/云台自稳与速率环.md
+ *   ⚠️ QD4310 的速度是【转子相对定子】, 而定子螺栓固定在车架上 —— 车头
+ *      自己转的那一份必须在指令里扣掉, 否则云台会跟着车头跑。
  * ---------------------------------------------------------------------------
  */
 
@@ -30,9 +25,11 @@
 #include "ti_msp_dl_config.h"
 #include "debug_uart.h"
 #include "gimbal.h"
+#include "guidance.h"
 #include "gyro_link.h"
 #include "vision_link.h"
 
+#include <math.h>
 #include <stdio.h>
 
 /* 打开后每秒多打一行 UART1 收到的原始字节 (十六进制)。
@@ -48,12 +45,12 @@
 #define LOOP_TICK_CYCLES        32000u
 #define LOOP_TICK_SEC           0.001f
 
-/* 发送周期。5 ms = 200 Hz。
- * 往返约 1.4 ms < 5 ms, 所以"一发一收"不会挡住这个节拍。
+/* 发送周期。4 ms = 250 Hz。
+ * 往返约 1.4 ms, 所以"一发一收"不会挡住这个节拍。
  * 发送仍然是【事件驱动】优先 —— 收到新视觉帧立刻发; 这个周期是兜底, 负责
- * 视觉帧之间 (以及视觉断流时) 继续推进。 */
-#define SEND_PERIOD_TICKS       5u
-#define SEND_PERIOD_SEC         ((float) SEND_PERIOD_TICKS * LOOP_TICK_SEC)
+ * 视觉帧之间 (以及视觉断流时) 继续推进。
+ * ⚠️ 改这里必须同步改 gimbal.c 的 GIMBAL_RX_TIMEOUT_TICKS —— 两者必须相等。 */
+#define SEND_PERIOD_TICKS       4u
 
 /* 多久没收到反馈/陀螺数据就认为掉线。单位节拍。 */
 #define GIMBAL_LOST_TICKS       300u   /* 300 ms */
@@ -66,7 +63,7 @@
 /* ==========================================================================
  * 云台初始化/恢复序列
  * ---------------------------------------------------------------------------
- * UART 是【一发一收】的: 发出一条之后, 状态会停在"等反馈", 最长 10 ms 才
+ * UART 是【一发一收】的: 发出一条之后, 状态会停在"等反馈", 最长 4 ms 才
  * 超时放行。 —— 第二条必然被 gimbal_send_cmd
  * 的"还在等反馈"挡掉, 而且不会报任何错。
  * 所以拆成状态: 每拍只尝试推进【一步】, 发成功了才进下一步, 发不出去下拍再试。
@@ -74,6 +71,7 @@
 #define GIM_STEP_IDLE       0u
 #define GIM_STEP_CLEAR      1u      /* 该发"清错误" */
 #define GIM_STEP_ENABLE     2u      /* 该发"使能" */
+#define GIM_STEP_ZERO       3u      /* 该发"设零点" —— 上电人工摆正后定基准 */
 
 /* 视觉掉线判定。MaixCam 约 55 fps (18 ms 一帧), 100 ms ≈ 连丢 5~6 帧。
  * ⚠️ 必须有这一条: 没有它的话 vision_link_get() 一直返回 false 时, err_valid
@@ -93,54 +91,55 @@
  *
  * 取值反推自  AIM_GAIN_RATE = λ / (f · T_视觉):
  *     λ      每个视觉帧误差衰减的指数 = 环路穿越频率 ÷ 视觉帧率。
- *            每帧消掉 1-e^(-λ)。>0.25 开始有振铃 (采样系统经验: 穿越频率
- *            别超过采样率的 1/4)。当前 0.146, 余量只剩 1.7 倍 
- *     f      像素焦距 ≈ 271。**推算值**(OS04D10 按 416x260 居中裁剪), 没实测
+ *            >0.25 开始有振铃 (穿越频率别超采样率的 1/4)。
+ *            当前 0.023×290×0.018 = 0.120, 余量 2 倍。
+ *     f      像素焦距 = 290 (2026-09-28 实测)。
  *     T_视觉 视觉帧周期 18 ms (55 fps) —— 是【视觉帧率】, 不是发送周期!
  *
  * ⚠️ f 错了环路增益就错。校验法: 靶纸水平平移 50mm @1m, err_x 应变化
  *    约 14.5 px (= 50/1000 × 290)。 */
 #define AIM_GAIN_RATE           0.023f
 
-/* 像素焦距, px/rad。2026-09-28 实测 ≈290 (之前推算的 271 偏低 7%)。
- * ⚠️ 现在【没有任何地方消费它】—— 前馈砍掉视觉那一支之后就没人用了。
- *    留着是因为它是实测值, 而且 AIM_GAIN_RATE 那段的 λ 推导要参考它。
- * 顺带: 水平视场 = 2·atan(208/290) ≈ 71°, 垂直 ≈ 48°。 */
-#define F_PX                    290.0f
-
-/* 视线角速度前馈增益。
- *
- * 补偿的是【积分器的速度误差】: yaw_ref 要以 ω 匀速涨, 就必须有恒定输入 ——
- *     dyaw_ref/dt = AIM_GAIN_RATE × err_x = ω   ⇒   err_x = ω / AIM_GAIN_RATE
- * 把斜率直接喂进去, 它就不用靠误差去攒了。
- *
- * 只前馈【云台自己的绝对角速度】(陀螺那一支)。完整的量是
- *     ω_视线 = ω_云台 + d(err_x)/dt / f        (恒等式)
- * 但第二支要过卡尔曼, 有 ~23 ms 滞后, 与即时的陀螺对不上 —— 抵消不完全就变成
- * "滞后的微分"(负阻尼), 这正是以前取 1.0 会震的原因。所以砍掉它。
- *
- * 只留陀螺仍然够: 匀速绕圈时 d(err_x)/dt ≈ 0, 两支本来就相等。
- *     ė_r = (G−1)·ω_云台 + K·err_x  ⇒  err_x = (1−G)·ω/K  ⇒ G=1 时稳态误差为 0
- * ⚠️ 上限【严格】是 1.0 —— G>1 时 (G−1)·KP 变成正极点, 发散。
- * ⚠️ GYRO_LSB_PER_DPS 错 X 倍等效于 G 要取 1/X, 这个旋钮正好吸收它。
- * 起手 0.5, 往 1.0 调, 看到振就退。 */
-#define LOS_FF_GAIN             0.055
-
-/* 死区, 像素。
-    卡尔曼滤波已经将err_x_f的抖动压在了亚像素级别，所以不需要很大的死区来抑制err_x_f的抖动
-    ，0.5在1m处对应2mm以内*/
+/* 死区, 像素。卡尔曼已把抖动压到亚像素, 0.5px @1m ≈ 2mm */
 #define AIM_DEADBAND_PX         0.5f
 
-/* 转角速率上限
- * 1.67 rad/s ≈ 95°/s
- * 注意它限的是**合成后**的总增量, 速率项也被一起限住 —— 速率项正常工作时量
- * 很小 (35°/s = 0.61 rad/s), 不会顶到这个上限。 */
-#define AIM_MAX_RATE_RAD_S       1.67f
+/* 速度指令上限, rad/s。1.67 ≈ 95°/s */
+#define W_MAX_RAD_S             1.67f
+
+/* 1 rpm = 6°/s */
+#define RAD_S_PER_RPM           0.10471975512f
+
+/* 电机正转方向 vs 几何/视觉的约定 (都以"逆时针为正")。
+ * 手册 5.3.2.1: 发正速度"沿正方向(逆时针)转动"; 上位机调参实测一致。
+ * 而 guidance 里的 atan2 也是逆时针为正 ⇒ 两者同约定 ⇒ 取 +1。
+ *
+ * 几何的定位角、几何前馈、视觉 P 三者共用同一个约定 —— 要么全对要么全反,
+ * 所以只用这一个符号统一翻。⚠️ 实测转反了就把它取反。 */
+#define MOTOR_DIR_SIGN          (+1.0f)
+
+/* 分级开关, 上台分步验证用:
+ *   0 = 只发 0 速度(验通信)
+ *   1 = 只几何前馈(断视觉, 验几何和符号)
+ *   2 = 只视觉 P(断前馈, 验视觉符号)
+ *   3 = 全部 */
+#define AIM_STAGE               3
+
+/* --- 进/出弯检测 ---
+ * psi 分不清"左弯末尾"和"右弯开头"(都是 180°), 只能用 psi_dot:
+ *   弯道 |psi_dot| ≈ v/R ≈ 1 rad/s     直道 ≈ 0 (只有循迹修正)
+ * 迟滞: 进弯用高阈值、出弯用低阈值, 各连续 CURVE_DEBOUNCE 拍才认。 */
+#define CURVE_ON_RADS       0.50f
+#define CURVE_OFF_RADS      0.20f
+#define CURVE_DEBOUNCE      25u     /* 4 ms 一拍 -> 100 ms */
+
+/* 进弯定位 (0x05) 发这么多拍, 然后交给前馈+视觉。
+ * 电机内部位置环很快, 200 ms 足够转完 143° 并稳定落位。4 ms 一拍 -> 200 ms */
+#define SYNC_MAX_TICKS  50u
 
 /* ==========================================================================
  * 视觉误差 2 态卡尔曼滤波
  * ---------------------------------------------------------------------------
- * err_x 有 ±3 px 抖动, 直接累加进 yaw_ref 会让云台抖。
+ * err_x 有 ±3 px 抖动, 直接喂进速度指令会让云台抖。
  *
  * 为什么用卡尔曼而不是"取平均": 它多估一个【变化率】状态, 能做预测,
  * 平滑的同时滞后小得多 —— 平均/低通只能"平滑过去", 它能"外推现在"。
@@ -150,8 +149,8 @@
 
 /* 观测噪声方差 = σ²。
  * 实测靶纸静止时 err_x 在 ±3 px 跳 -> σ≈2 -> 理论上 R=4。
- * ⚠️ R 越大滞后越大: k0 = a/(a+R) 就是"每帧采纳多少观测", R=4 时阶跃滞后 57 ms。
- *    现在 R=1 + Q_RATE=100 -> 按稳态增益算 90% 约 23 ms (1.3 视觉帧), 过冲极小。
+ * ⚠️ R 越大滞后越大: k0 = a/(a+R) 就是"每帧采纳多少观测"。
+ *    现在 R=1 + Q_RATE=400 -> 跟得很快、滞后很小。
  *    代价是残留抖动变大, 由 AIM_DEADBAND_PX(0.5) 兜住。 */
 #define KF_R            1.0f
 
@@ -160,88 +159,28 @@
 #define KF_Q_POS        0.5f
 #define KF_Q_RATE       400
 
-/* 目标丢失超过这么久(ms)就复位滤波器, 免得重新捕获时旧状态造成跳变 */
-#define KF_RESET_MS     5000u
+/* 目标丢了超过这么久(ms)才复位滤波器 —— 视觉 P 是无记忆的, 而卡尔曼的
+ * 速度状态 x1 在长时间丢靶后完全过期, 不复位会甩一下。 */
+#define KF_RESET_MS     500u
 
 /* ==========================================================================
- * 找靶 (视觉在线, 但没识别到靶纸时)
- * ========================================================================== */
-
-/* 找靶总开关。0 = 完全不找靶 (丢靶就守在当前朝向自稳, 云台不转)。 */
-#define SEARCH_ENABLE       1
-
-/* 扫描速率, rad/s ≈ 46°/s。 */
-#define SEARCH_RATE         0.70f
-
-/* 丢靶前误差小于这个就不搜 —— 靶纸就在附近(比如被人遮挡), 乱搜反而跑远 */
-#define SEARCH_MIN_ERR_PX   0.0f
-
-/* 连续丢靶超过这么久(ms)才启动找靶。
- * ⚠️ 判据一律用【时间】不用帧数 
- * ⚠️ 没它的话, 视觉单帧检测失败就立刻以 SEARCH_RATE(46°/s) 猛推 yaw_ref ——
- *    而视觉环在 err_x=10px 时本来只该推 0.1 rad/s, 差十几倍。
- *    于是: 检测一抖 -> 猛推 -> 冲过靶心 -> 反向再推 -> 停不下来。
- * 200 ms 的道理: 门槛没到时 yaw_ref 冻住, 航向环照常自稳 —— 等待期云台只是
- *    原地保持指向。而真丢靶后光扫一圈就要 8 s, 晚 200 ms 起步无所谓。 */
-#define SEARCH_LOST_MS      200u
-
-/* 一次找靶最多扫这么久。8 s × SEARCH_RATE(0.80 rad/s) = 6.4 rad ≈ 366°, 扫满一圈。 */
-#define SEARCH_MAX_MS       8000u
-
-/* 误差收进 SEARCH_LOCK_PX 后, 还要【连续停留】这么久才算真锁定, 才允许重置
- * 扫描预算。
- * ⚠️ 只判"进过范围"不行: 云台扫过靶心时 err_x 必然从 +200 穿到 -200,
- *    中途一定经过中心 —— 那一刻就重置的话扫描永远停不下来。
- * ⚠️ 也不能用"看到靶"当条件: 扫过靶时云台会连续几十帧看到靶。 */
-#define SEARCH_LOCK_PX      20.0f
-#define SEARCH_LOCK_MS      300u
-
-/* 上电扫描方向。
- * ⚠️ 2026-09-27 实测: +1 扫的方向反了 (跑道上靶子在顺时针很小的角度内)。 */
-#define BOOT_SEARCH_DIR     (-1.0f)
-
-/* ==========================================================================
- * 航向环 (IMU 角度闭环) —— 参考江南大学方案
- * ---------------------------------------------------------------------------
- * 江南: 角度PID(反馈=IMU角度) -> 速度PID(反馈=IMU角速度) -> 力矩
- * 我们电机内部自带角度环, 所以等价成: 角度环 PI + 阻尼 -> Δθ
- *
- * ⚠️ 为什么扔掉纯速率环: 它要让 ω=0, 带宽必须高, 100 Hz 陀螺 + 10 ms 延迟
- *    撑不住 —— 实测 K=0.15 就震。角度环只需"守住方向", 延迟不致命。
- *    详见 docs/云台自稳与速率环.md
+ * 陀螺 (装在车体上, 测的是车体偏航角)
  * ========================================================================== */
 
 /* 陀螺轴。Z 轴朝上 -> 2 */
 #define GYRO_RATE_AXIS      2u
 
-/* 角度环 P, 单位 1/s。Kp=4 -> 时间常数 250 ms (远大于 10 ms 延迟, 安全) */
-#define YAW_KP              40.0f
-
-/* 角度环 I, 单位 1/s²。消掉"车匀速转"时的稳态误差 —— 江南 Ki=0.8 同理 */
-#define YAW_KI              0
-
-/* 积分限幅, rad/s */
-#define YAW_I_LIMIT         0.2f
-
-/* 阻尼系数 (原来的 GYRO_RATE_K)。只做阻尼, 别大。
- * ⚠️ 实测: 纯速率环时 0.3 震 / 0.15 轻微震 / 0 不震 */
-#define YAW_KD              0.15
-
-//正确参数
-#define GYRO_RATE_SIGN      (-1.0f)  
-
-
-#define YAW_SIGN            (-1.0f)
-
-/* 阶段开关: 1 = 只测自稳(yaw_ref 固定, 不接视觉) / 0 = 接视觉
- * 先跑 1, 确认"手转车身云台能守住方向", 再改 0 */
-#define YAW_HOLD_ONLY       0
-
-/* 一阶低通, 每陀螺帧一次 (100 Hz)。1.0 = 关闭。
- * ⚠️ 0.9 的截止频率 ≈ 45 Hz, 逼近奈奎斯特 (50 Hz), 基本等于没滤。
- *    阻尼项和前馈都用它, 要真滤噪得降到 0.3~0.5 (约 6~11 Hz),
- *    代价是给这两项都加滞后。 */
+/* 一阶低通, 每陀螺帧一次 (100 Hz)。1.0 = 关闭 */
 #define GYRO_LPF_ALPHA      1.0f
+
+/* 陀螺原始角速度 (GyroZ) 与【车体偏航角 psi】的符号关系。
+ * psi 是从模块 Yaw 差分累加的 (顺时针为正), 而模块的 Yaw 与 GyroZ 【反号】——
+ * 由旧版航向环的 YAW_SIGN=-1 / GYRO_RATE_SIGN=-1 一起推出 (两个都实测过):
+ *   阻尼要成立 ⇒ GYRO_RATE_SIGN = s, 而两者都是 -1 ⇒ s = -1。
+ * ⚠️ 前馈漏了这个负号 -> 云台往反方向补 -> 直接跑飞。
+ * (进/出弯检测取 |ψ̇|, 不受符号影响。) */
+#define GYRO_RATE_SIGN      (-1.0f)
+#define PSI_RATE()          (GYRO_RATE_SIGN * yaw_rate_lpf * DEG2RAD)
 
 /* ==========================================================================
  * 外环
@@ -299,72 +238,46 @@ static void vision_filter_reset(void)
     s_kf_on = false;
 }
 
-/* 角度环的积分状态 */
-static float g_yaw_i = 0.0f;
+/* 本拍算出来的速度指令 (rad/s), 只给调试行看 */
+static float s_last_w = 0.0f;
 
-/* 算并发出这一步转角。
+/* 算并发出这一拍的速度指令 (0x04)。
  *
- * 陀螺有效时走【航向环】: 角度环(PI) 把 yaw_total 拉到 yaw_ref, 再用陀螺
- * 角速度做阻尼。陀螺掉线时退回【纯视觉】直接发增量 —— 因为 yaw_total 会
- * 冻住, 继续用角度环等于拿陈旧值硬顶。
+ *   w_ff      几何前馈, rad/s —— 一直生效, 不依赖视觉
+ *   err_valid 看到靶才叠加视觉 P
  *
- *   yaw_ref_rad   : 目标航向 (rad, 连续)
- *   yaw_total_rad : IMU 连续航向 (rad)
- *   yaw_rate_dps  : 云台偏航角速度 (°/s)
- *   gyro_ok       : 陀螺数据是否有效
- *   err_valid / err_x_f : 兜底用的视觉误差 (滤波后)
- * 返回 false 表示这一拍没发。 */
-static bool aim_step(float yaw_ref_rad, float yaw_total_rad,
-                     float yaw_rate_dps, bool gyro_ok,
-                     bool err_valid, float err_x_f)
+ * 返回 false 表示这一拍没发出去。 */
+static bool aim_send(float w_ff, bool err_valid, float err_x_f)
 {
-    const float max_step = AIM_MAX_RATE_RAD_S * SEND_PERIOD_SEC;
-    float dtheta;
+    float w;
 
-    if (!gyro_ok) {
-        /* --- 兜底: 纯视觉 ---
-         * ⚠️ 陀螺掉线时 yaw_total 会【冻住】, 航向环的反馈就失效了 ——
-         *    再用它会变成"云台转了但误差不变" -> 一路转到限位。
-         *    所以摘掉航向环, 退回直接用视觉误差发增量。
-         *    (视觉这条信息没断, 所以至少还在追靶, 只是失去自稳) */
-        g_yaw_i = 0.0f;         /* 积分清零, 免得陀螺恢复时甩一下 */
-        if (!err_valid ||
-            ((err_x_f >= -AIM_DEADBAND_PX) && (err_x_f <= AIM_DEADBAND_PX))) {
-            return false;
-        }
-        dtheta = AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
-    } else {
-        /* --- 航向环: 角度 PI + 速度阻尼 --- */
-        float e = yaw_ref_rad - yaw_total_rad;   /* 两边都连续, 不用回绕处理 */
-        float w = YAW_KP * e + g_yaw_i;          /* 目标角速度, rad/s */
-        w += GYRO_RATE_SIGN * YAW_KD * (yaw_rate_dps * DEG2RAD);
+#if AIM_STAGE == 0
+    /* 只发 0 速度 —— 验证通信和电机速度环 */
+    (void) w_ff; (void) err_valid; (void) err_x_f;
+    w = 0.0f;
+#else
+    w = w_ff;
 
-        if (w > AIM_MAX_RATE_RAD_S) {
-            w = AIM_MAX_RATE_RAD_S;
-        } else if (w < -AIM_MAX_RATE_RAD_S) {
-            w = -AIM_MAX_RATE_RAD_S;
-        }
-
-        /* 积分放在限幅【之后】, 免得饱和期间继续累积 */
-        g_yaw_i += YAW_KI * e * SEND_PERIOD_SEC;
-        if (g_yaw_i > YAW_I_LIMIT) {
-            g_yaw_i = YAW_I_LIMIT;
-        } else if (g_yaw_i < -YAW_I_LIMIT) {
-            g_yaw_i = -YAW_I_LIMIT;
-        }
-
-        dtheta = w * SEND_PERIOD_SEC;
+#if (AIM_STAGE == 2) || (AIM_STAGE == 3)
+    if (err_valid &&
+        ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX))) {
+        w += AIM_GAIN_RATE * err_x_f;
     }
+#else
+    (void) err_valid; (void) err_x_f;
+#endif
 
-    /* 统一限速 —— 两条路径都走这里。主路径里 w 已经夹过 (冗余但无害),
-     * 兜底路径没有别的保护, 全靠这一道。 */
-    if (dtheta > max_step) {
-        dtheta = max_step;
-    } else if (dtheta < -max_step) {
-        dtheta = -max_step;
+    if (w > W_MAX_RAD_S) {
+        w = W_MAX_RAD_S;
+    } else if (w < -W_MAX_RAD_S) {
+        w = -W_MAX_RAD_S;
     }
+#endif
 
-    return gimbal_step_rad(dtheta);
+    w *= MOTOR_DIR_SIGN;        /* 见 MOTOR_DIR_SIGN */
+    s_last_w = w;
+
+    return gimbal_set_speed(w / RAD_S_PER_RPM);
 }
 
 /* ==========================================================================
@@ -406,22 +319,19 @@ int main(void)
 
     float    err_x     = 0.0f;   /* 原始误差 (调试用) */
     float    err_x_f   = 0.0f;   /* 卡尔曼滤波后的误差 —— 控制用这个 */
-    uint16_t lost_ms   = 0;      /* 距上次看到靶过了多少 ms (找靶和卡尔曼复位的判据) */
-    uint16_t lock_ms   = 0;      /* 误差在锁定范围内连续停留了多少 ms */
+    uint16_t lost_ms   = 0;      /* 距上次看到靶过了多少 ms (卡尔曼复位判据) */
     bool     err_valid = false;
 
-    /* --- 找靶 --- */
-    float    last_err_x  = 0.0f; /* 最后一次有效 err_x —— 丢靶后往哪边找 */
-    uint16_t search_ms   = 0;    /* 本次找靶已经扫了多少 ms */
-    bool     ever_seen   = false;/* 曾经识别到过靶纸吗 —— 区分上电找靶/丢靶找靶 */
-    bool     searching   = false;/* 上一拍真推过 yaw_ref? 认回靶时要拉平 */
-    bool     gyro_was_ok = false;/* 上一拍陀螺有效? 用来抓"刚上线"那一拍 */
-    float    yaw_rate  = 0.0f;  /* °/s */
-    float    yaw_rate_lpf = 0.0f;  /* 低通后的角速度, 速率环喂这个 */
-    float    yaw_total  = 0.0f;   /* IMU 连续航向 (rad), 由回绕累加得到 */
-    float    yaw_prev   = 0.0f;   /* 上一帧原始航向 (deg), 算回绕用 */
-    bool     yaw_inited = false;  /* 首帧只记基准, 不累加 */
-    float    yaw_ref    = 0.0f;   /* 目标航向 (rad)。阶段1固定 0 = 锁定开机朝向 */
+    /* --- 车体偏航 (陀螺) --- */
+    float    yaw_rate     = 0.0f; /* °/s, 瞬时 */
+    float    yaw_rate_lpf = 0.0f; /* °/s, 低通后 —— 前馈用这个 */
+    float    psi_rad      = 0.0f; /* 车体偏航角 (rad), 回绕差分累加 */
+    float    psi_prev     = 0.0f; /* 上一帧原始 Yaw (deg), 算回绕用 */
+    bool     psi_inited   = false;/* 首帧只记基准, 不累加 */
+    bool     in_curve     = false;/* 当前在弯道上? 直道不瞄 */
+    uint16_t curve_cnt    = 0;    /* |psi_dot| 连续超阈值的拍数, 去抖用 */
+    bool     curve_sync   = false;/* 进弯后还在用 0x05 定位中 */
+    uint16_t sync_cnt     = 0;    /* 定位发了多少拍, 超时兜底用 */
     bool     need_send = false; /* 本拍收到了新视觉帧 -> 立刻发, 不等定时 */
     uint8_t  gim_step  = GIM_STEP_IDLE;  /* 云台初始化序列的推进状态 */
 
@@ -470,18 +380,16 @@ int main(void)
             need_send = true;       /* 有新帧 -> 这一拍立刻发出去 */
             if (vmsg.status == VISION_STATUS_TARGET_VALID) {
                 err_x = (float) vmsg.err_x;      /* 原始值, 调试用 */
-                /* 重新捕获就复位 —— 两种情况:
-                 *   ① 丢了很久 (KF_RESET_MS)
-                 *   ② 搜索真推过 yaw_ref: 云台已扫走几十度, 像素系的旧状态无意义
-                 * 不复位的话, 重捕获那一帧的新息巨大, 会给 x1 一大脚 -> 甩一下。 */
-                if (searching || (lost_ms >= KF_RESET_MS)) {
+                /* 丢了一段再重捕获就复位滤波器 —— 旧的 x1 是陈旧的,
+                 * 不复位的话新息巨大, 会给 x1 一大脚 -> 甩一下。 */
+                if (lost_ms >= KF_RESET_MS) {
                     vision_filter_reset();
                 }
                 err_x_f   = vision_filter(err_x, dt_vis);   /* 滤波后, 控制用 */
                 err_valid = true;
             } else {
                 /* 丢靶。⚠️ err_x 恒为 0 是"无数据"不是"已对准", 必须用
-                 * err_valid 区分开。视觉项归零后, 航向环继续维持自稳。 */
+                 * err_valid 区分开, 否则会把 0 当成"已经瞄好了"。 */
                 err_valid = false;
             }
         } else if (vis_lost < 0xFFFFu) {
@@ -494,22 +402,12 @@ int main(void)
             err_valid = false;
         }
 
-        /* 距上次看到靶过了多少 ms —— 找靶启动和滤波器复位的统一判据。
+        /* 距上次看到靶过了多少 ms —— 滤波器复位的判据。
          * ⚠️ 用时间不用帧数: 视觉帧率随场景变, 帧数没有确定的时间含义。 */
         if (err_valid) {
             lost_ms = 0;
         } else if (lost_ms < 0xFFFFu) {
             lost_ms++;
-        }
-
-        /* 在锁定范围内连续停留了多久 —— 判"真锁定", 见 SEARCH_LOCK_MS */
-        if (err_valid &&
-            (err_x_f > -SEARCH_LOCK_PX) && (err_x_f < SEARCH_LOCK_PX)) {
-            if (lock_ms < 0xFFFFu) {
-                lock_ms++;
-            }
-        } else {
-            lock_ms = 0;
         }
 
         /* --- 陀螺 --- */
@@ -525,18 +423,18 @@ int main(void)
              * 用【差分累加】而不是直接取绝对值, 这样偶尔漏一帧也不丢信息。 */
             {
                 float now = gmsg.yaw_deg;
-                if (!yaw_inited) {
-                    yaw_prev   = now;      /* 首帧只记基准, yaw_total 从 0 起算 */
-                    yaw_inited = true;
+                if (!psi_inited) {
+                    psi_prev   = now;      /* 首帧只记基准, psi 从 0 起算 */
+                    psi_inited = true;
                 } else {
-                    float d = now - yaw_prev;
+                    float d = now - psi_prev;
                     if (d > 180.0f) {
                         d -= 360.0f;       /* 359° -> 1° 是前进, 不是倒退 358° */
                     } else if (d < -180.0f) {
                         d += 360.0f;
                     }
-                    yaw_total += YAW_SIGN * d * DEG2RAD;
-                    yaw_prev   = now;
+                    psi_rad  += d * DEG2RAD;
+                    psi_prev  = now;
                 }
             }
 #if DEBUG_PRINT_ENABLE
@@ -558,6 +456,12 @@ int main(void)
             }
         } else if (gim_step == GIM_STEP_ENABLE) {
             if (gimbal_enable()) {
+                gim_step = GIM_STEP_ZERO;
+            }
+        } else if (gim_step == GIM_STEP_ZERO) {
+            /* ⚠️ 上电时人已把云台摆到车头方向 —— 把这那一刻设成 0°。
+             * 之后所有 0x05 绝对角都以它为准, 不设的话基准是随机的。 */
+            if (gimbal_set_zero()) {
                 gim_step = GIM_STEP_IDLE;
             }
         }
@@ -603,92 +507,78 @@ int main(void)
             if (gim_step != GIM_STEP_IDLE) {
                 /* 初始化序列正在跑, 这一拍不占发送机会, 让给序列 */
             } else {
-                /* 陀螺掉线时把速率项置无效, 别拿陈旧角速度继续猛补 */
-                bool rate_ok = (gyro_lost < GYRO_LOST_TICKS);
-                /* 视觉在线? ⚠️ 上电时 MaixCam 要好几秒才起来 (实测 ~44 s),
-                 *    这期间 vis_lost 一路涨 —— 不在线就绝不找靶, 免得盲扫。 */
-                bool vis_ok  = (vis_lost  < VISION_LOST_TICKS);
-
-                /* 陀螺刚上线: yaw_total 才从 0 起算, 而 yaw_ref 是掉线期间由
-                 * 视觉积分器自己攒的 —— 两者从来没对齐过。不拉平的话
-                 * e = yaw_ref 就是几十度, 航向环一接手就把云台甩到别处去。
-                 * (掉线期间 aim_step 走纯视觉兜底, 压根不看 yaw_total。) */
-                if (rate_ok && !gyro_was_ok) {
-                    yaw_ref   = yaw_total;
-                    searching = false;
+#if AIM_STAGE == 0
+                /* 台架验证: 只发 0 速度 */
+                if (!gimbal_set_speed(0.0f)) {
+                    gimbal_send_cmd(GIMBAL_CMD_SPEED, 0);
                 }
-                gyro_was_ok = rate_ok;
+#else
+                /* psi_dot = d(psi)/dt, 带符号 —— 见 GYRO_RATE_SIGN */
+                bool  rate_ok = (gyro_lost < GYRO_LOST_TICKS);
+                float psi_dot = rate_ok ? PSI_RATE() : 0.0f;
 
-#if !YAW_HOLD_ONLY
-                /* --- 阶段 2: 视觉驱动目标航向 ---
-                 * 看到靶 -> 立刻停搜索, 用【滤波后】的误差累加 yaw_ref。 */
-                if (err_valid) {
-                    ever_seen   = true;         /* 标记: 之后丢靶就按方向找 */
-                    last_err_x  = err_x_f;      /* 记住方向, 丢靶后要用 */
-                    /* 从搜索切回跟踪: 【无条件】拉平。搜索期间 yaw_ref 比
-                     * yaw_total 领先约 SEARCH_RATE/YAW_KP ≈ 0.2 rad (11.5°),
-                     * 不拉掉的话航向环会继续把云台推过去 -> 冲过靶心 -> 靶出画
-                     * -> 又丢靶又扫, 就是"变缓但停不住"。 */
-                    if (searching) {
-                        yaw_ref   = yaw_total;
-                        searching = false;
+                /* --- 进/出弯检测 ---
+                 * psi 分不清"左弯末尾"和"右弯开头"(都是 180°), 只能用 psi_dot:
+                 *   弯道 |psi_dot| ≈ v/R ≈ 1 rad/s     直道 ≈ 0
+                 * 迟滞 (进弯用高阈值/出弯用低阈值) + 连续 N 拍去抖。 */
+                float thr = in_curve ? CURVE_OFF_RADS : CURVE_ON_RADS;
+
+                if (fabsf(psi_dot) > thr) {
+                    if (curve_cnt < 0xFFFFu) {
+                        curve_cnt++;
                     }
-                    /* 真锁定 (在范围内连续停留够久) 才重置扫描预算 —— 见 SEARCH_LOCK_MS */
-                    if (lock_ms >= SEARCH_LOCK_MS) {
-                        search_ms = 0;
-                    } else if (search_ms > SEND_PERIOD_TICKS) {
-                        /* 看到靶就退额度, 速率与累积对齐 (本块已在 if (err_valid) 里)。
-                         * 没有这条的话, 瞄准误差一直卡在 SEARCH_LOCK_PX 外面时
-                         * 只扣不回, 8000 耗尽后【永远不再扫】。 */
-                        search_ms -= SEND_PERIOD_TICKS;
+                } else {
+                    curve_cnt = 0;
+                }
+
+                bool curve_new = false;
+                if (curve_cnt >= CURVE_DEBOUNCE) {
+                    curve_cnt = 0;
+                    if (in_curve) {
+                        in_curve = false;       /* 出弯: 下一拍起云台停住 */
                     } else {
-                        search_ms = 0;
-                    }
-                    /* 速率前馈: 只喂云台自己的绝对角速度 —— 见 LOS_FF_GAIN。
-                     * ⚠️ 不受死区管 —— 它是速度项不是误差项, 误差进死区时它照样要顶。
-                     * ⚠️ 必须判 rate_ok: 陀螺掉线时 yaw_rate_lpf 会【冻住】,
-                     *    前馈拿着陈旧值一直往 yaw_ref 上加 -> 云台匀速转下去。 */
-                    if (rate_ok) {
-                        yaw_ref += LOS_FF_GAIN * (yaw_rate_lpf * DEG2RAD) * SEND_PERIOD_SEC;
-                    }
-
-                    if ((err_x_f < -AIM_DEADBAND_PX) || (err_x_f > AIM_DEADBAND_PX)) {
-                        yaw_ref += AIM_GAIN_RATE * err_x_f * SEND_PERIOD_SEC;
+                        in_curve  = true;       /* 进弯 */
+                        curve_new = true;
                     }
                 }
+                if (curve_new) {
+                    curve_sync = true;
+                }
 
-                /* --- 找靶 ---
-                 * ⚠️ 故意用【独立 if】而非 else if: 这样 searching 只在真推了
-                 *    yaw_ref 时才置位。塞进 else if 的话, "丢靶但误差太小不搜"
-                 *    也会被标成 searching, 下次看到靶就误触发上面的拉平。 */
-                if (SEARCH_ENABLE &&
-                    !err_valid &&
-                    vis_ok &&                             /* 视觉在线 */
-                    (lost_ms   >= SEARCH_LOST_MS) &&      /* 丢得够久才搜 */
-                    (search_ms <  SEARCH_MAX_MS)) {       /* 本次还没扫够一圈 */
-                    if (!ever_seen) {
-                        /* 上电找靶: 还没见过靶, 固定方向扫 */
-                        yaw_ref   += BOOT_SEARCH_DIR * SEARCH_RATE * SEND_PERIOD_SEC;
-                        search_ms += SEND_PERIOD_TICKS;
-                        searching  = true;
-                    } else if ((last_err_x >  SEARCH_MIN_ERR_PX) ||
-                               (last_err_x < -SEARCH_MIN_ERR_PX)) {
-                        /* 丢靶找靶: 按最后看到靶的方向扫。
-                         * ⚠️ 误差太小就不搜 —— 靶纸可能就在附近(比如被人挡住),
-                         *    乱扫反而跑远。 */
-                        yaw_ref   += ((last_err_x > 0.0f) ? 1.0f : -1.0f) *
-                                     SEARCH_RATE * SEND_PERIOD_SEC;
-                        search_ms += SEND_PERIOD_TICKS;
-                        searching  = true;
+                if (!in_curve) {
+                    /* --- 直道: 不瞄, 云台停在原地 --- */
+                    if (!aim_send(0.0f, false, 0.0f)) {
+                        gimbal_send_cmd(GIMBAL_CMD_SPEED, 0);
+                    }
+                } else if (curve_sync) {
+                    /* --- 进弯: 把云台拉到几何算出的绝对角。
+                     * 直道上云台停着, 出弯→进弯差 112°, 靶早出视野了, 光靠
+                     * 视觉 P 拉不回来。
+                     *
+                     * ⚠️ 不能"发一次就走" —— 0x05 只让电机进入内部位置环, 下一拍
+                     *    的速度指令会立刻把它覆盖掉, 云台基本没转。
+                     * ⚠️ 也【不要】拿 err_valid / err_x 提前切 —— 让电机的内部
+                     *    位置环自己落位最稳, 实测这样是"完美落位"; 拿视觉判据提前
+                     *    切反而会打断它。发满 SYNC_MAX_TICKS 就交给前馈+视觉。 --- */
+                    if (gimbal_set_angle(MOTOR_DIR_SIGN * guidance_abs(psi_rad))) {
+                        if (++sync_cnt >= SYNC_MAX_TICKS) {
+                            curve_sync = false;
+                            sync_cnt   = 0;
+                        }
+                    }
+                } else {
+                    /* --- 弯道中: 几何前馈 + 视觉 P --- */
+                    float w_ff = 0.0f;
+#if (AIM_STAGE == 1) || (AIM_STAGE == 3)
+                    w_ff = guidance_ff(psi_rad, psi_dot);
+#endif
+                    if (!aim_send(w_ff, err_valid, err_x_f)) {
+                        /* ⚠️ 速度模式下【不能】补 NOP —— 0x00 是"保持上一拍速度",
+                         *    云台会按旧速度一直转下去。必须补一条显式 0 速度。 */
+                        gimbal_send_cmd(GIMBAL_CMD_SPEED, 0);
                     }
                 }
 #endif
-                if (!aim_step(yaw_ref, yaw_total, yaw_rate_lpf, rate_ok,
-                              err_valid, err_x_f)) {
-                    /* 没发出任何分量 —— 发 NOP 保活, 反馈才不会断
-                     * (指令 0x00 就是"不改变任何东西, 只为索取反馈报文")。 */
-                    gimbal_send_cmd(GIMBAL_CMD_NOP, 0);
-                }
             }
         }
 
@@ -706,17 +596,16 @@ int main(void)
          *      两者对比就能看出卡尔曼压掉了多少抖动
          *   R  当前偏航角速度 (°/s) —— ⚠️ 打印的是 ×10 的值 (R=35 表示 3.5°/s)
          *   |R| 本周期平均 |角速度|, 同样 ×10
-         *   P/D 当前烧进去的 YAW_KP(×10) / YAW_KD(×100) —— 确认板子跑的是哪版
+         *   S  当前 AIM_STAGE, 确认板子跑的是哪一档
          *
-         *   Y  连续航向 (°), 由陀螺 Yaw 回绕累加而来。手转车身它会跟着变,
-         *      云台自稳成功的话它【应该基本不动】。
-         *   e  角度误差 = yaw_ref − yaw_total (°)。自稳成功时 e 应收敛到 0 附近。
+         *   psi 车体偏航角 (°), 由陀螺 Yaw 回绕累加。手推车转弯它会跟着变。
+         *   Del ∠BOA (°), 由 psi 算出的车在弧上的位置。左弯 90°→180°→90°。
+         *   W   本拍发出去的速度指令 (°/s) —— 前馈 + 视觉的合成结果。
          */
         if (++dbg_tick >= DEBUG_PERIOD_TICKS) {
             dbg_tick = 0;
-            printf("P=%d D=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld Ef=%ld R=%ld |R|=%ld | Y=%ld e=%ld\r\n",
-                   (int) (YAW_KP * 10.0f),            /* 角度环 P ×10 */
-                   (int) (YAW_KD * 100.0f),           /* 阻尼系数 ×100 */
+            printf("S=%d | V=%lu vc=%lu vo=%lu vg=%u | G=%lu M=%lu TO=%lu ME=%lu RB=%lu | E=%ld Ef=%ld R=%ld |R|=%ld | psi=%ld Del=%ld W=%ld\r\n",
+                   (int) AIM_STAGE,
                    (unsigned long) vcount,
                    (unsigned long) g_vision_bad_csum,
                    (unsigned long) g_vision_overrun,
@@ -730,8 +619,9 @@ int main(void)
                    (long) err_x_f,                              /* Ef: 滤波后 (控制用) */
                    (long) (yaw_rate * 10.0f),                   /* R: °/s ×10 */
                    (long) (((rabs_cnt > 0u) ? (rabs_sum / (float) rabs_cnt) : 0.0f) * 10.0f),
-                   (long) (yaw_total / DEG2RAD),                /* Y: 连续航向 (°) */
-                   (long) ((yaw_ref - yaw_total) / DEG2RAD));   /* e: 角度误差 (°) */
+                   (long) (psi_rad / DEG2RAD),                  /* psi: 车体偏航角 (°) */
+                   (long) (guidance_delta(psi_rad) / DEG2RAD),  /* Del: ∠BOA (°) */
+                   (long) (s_last_w / DEG2RAD));                /* W: 指令 (°/s) */
             vis_gap_max = 0;        /* 每个报告周期重新统计 */
             rabs_sum = 0.0f;
             rabs_cnt = 0;
