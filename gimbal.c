@@ -22,7 +22,7 @@
  * 帧就永远攒不齐 (表现为 g_gimbal_rx_bytes 在涨、而 M 和 ME 都是 0)。
  *
  * ⚠️ 不能大于发送周期, 否则发不出下一条。改 SEND_PERIOD_TICKS 时这里要跟着改。 */
-#define GIMBAL_RX_TIMEOUT_TICKS  4u //和发送周期一致 (empty.c 的 SEND_PERIOD_TICKS)
+#define GIMBAL_RX_TIMEOUT_TICKS  5u //和发送周期一致 (empty.c 的 SEND_PERIOD_TICKS)
 
 /* TX FIFO 满时的自旋上限, 防止 UART 时钟异常把主循环卡死 */
 #define GIMBAL_TX_GUARD      200000u

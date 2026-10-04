@@ -45,12 +45,10 @@
 #define LOOP_TICK_CYCLES        32000u
 #define LOOP_TICK_SEC           0.001f
 
-/* 发送周期。4 ms = 250 Hz。
- * 往返约 1.4 ms, 所以"一发一收"不会挡住这个节拍。
- * 发送仍然是【事件驱动】优先 —— 收到新视觉帧立刻发; 这个周期是兜底, 负责
- * 视觉帧之间 (以及视觉断流时) 继续推进。
+/* 发送周期。5 ms = 200 Hz。陀螺 100 Hz (10 ms), 5 ms 正好每 2 拍一个新角速度,
+ * 前馈节奏均匀。发送事件驱动优先(新视觉帧立刻发), 这个周期是兜底。
  * ⚠️ 改这里必须同步改 gimbal.c 的 GIMBAL_RX_TIMEOUT_TICKS —— 两者必须相等。 */
-#define SEND_PERIOD_TICKS       4u
+#define SEND_PERIOD_TICKS       5u
 
 /* 多久没收到反馈/陀螺数据就认为掉线。单位节拍。 */
 #define GIMBAL_LOST_TICKS       300u   /* 300 ms */
@@ -130,11 +128,11 @@
  * 迟滞: 进弯用高阈值、出弯用低阈值, 各连续 CURVE_DEBOUNCE 拍才认。 */
 #define CURVE_ON_RADS       0.50f
 #define CURVE_OFF_RADS      0.20f
-#define CURVE_DEBOUNCE      25u     /* 4 ms 一拍 -> 100 ms */
+#define CURVE_DEBOUNCE      20u     /* 5 ms 一拍 -> 100 ms */
 
-/* 进弯定位 (0x05) 发这么多拍, 然后交给前馈+视觉。
- * 电机内部位置环很快, 200 ms 足够转完 143° 并稳定落位。4 ms 一拍 -> 200 ms */
-#define SYNC_MAX_TICKS  50u
+/* 进弯定位 (0x05) 保持 60 拍 (5 ms/拍 = 300 ms), 然后交给前馈+视觉。
+ * 电机内部位置环很快, 300 ms 够转完 143° 并稳定落位。 */
+#define SYNC_MAX_TICKS  60u
 
 /* ==========================================================================
  * 视觉误差 2 态卡尔曼滤波
@@ -551,15 +549,9 @@ int main(void)
                         gimbal_send_cmd(GIMBAL_CMD_SPEED, 0);
                     }
                 } else if (curve_sync) {
-                    /* --- 进弯: 把云台拉到几何算出的绝对角。
-                     * 直道上云台停着, 出弯→进弯差 112°, 靶早出视野了, 光靠
-                     * 视觉 P 拉不回来。
-                     *
-                     * ⚠️ 不能"发一次就走" —— 0x05 只让电机进入内部位置环, 下一拍
-                     *    的速度指令会立刻把它覆盖掉, 云台基本没转。
-                     * ⚠️ 也【不要】拿 err_valid / err_x 提前切 —— 让电机的内部
-                     *    位置环自己落位最稳, 实测这样是"完美落位"; 拿视觉判据提前
-                     *    切反而会打断它。发满 SYNC_MAX_TICKS 就交给前馈+视觉。 --- */
+                    /* --- 进弯: 0x05 拉到几何绝对角, 保持满 SYNC_MAX_TICKS 再交棒。
+                     * 不能"发一次就走"(下一拍 0x04 会覆盖位置环, 云台基本没转),
+                     * 也不要拿视觉误差提前切 —— 打断位置环反而落不稳。 --- */
                     if (gimbal_set_angle(MOTOR_DIR_SIGN * guidance_abs(psi_rad))) {
                         if (++sync_cnt >= SYNC_MAX_TICKS) {
                             curve_sync = false;
