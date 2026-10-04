@@ -155,12 +155,12 @@
  * ⚠️ R 越大滞后越大: k0 = a/(a+R) 就是"每帧采纳多少观测"。
  *    现在 R=1 + Q_RATE=400 -> 跟得很快、滞后很小。
  *    代价是残留抖动变大, 由 AIM_DEADBAND_PX(0.5) 兜住。 */
-#define KF_R            1.0f
+#define KF_R            4.0f
 
 /* 过程噪声。越大越信观测(跟得快、但噪声大)。
  * Q_POS 管误差, Q_RATE 管变化率 —— 变化率给大点, 让速度估计跟得上 */
-#define KF_Q_POS        0.5f
-#define KF_Q_RATE       400
+#define KF_Q_POS        0.2f
+#define KF_Q_RATE       25
 
 /* 目标丢了超过这么久(ms)才复位滤波器 —— 视觉 P 是无记忆的, 而卡尔曼的
  * 速度状态 x1 在长时间丢靶后完全过期, 不复位会甩一下。 */
@@ -174,7 +174,7 @@
 #define GYRO_RATE_AXIS      2u
 
 /* 一阶低通, 每陀螺帧一次 (100 Hz)。1.0 = 关闭 */
-#define GYRO_LPF_ALPHA      0.4f
+#define GYRO_LPF_ALPHA      1.0f
 
 /* 陀螺原始角速度 (GyroZ) 与【车体偏航角 psi】的符号关系。
  * psi 是从模块 Yaw 差分累加的 (顺时针为正), 而模块的 Yaw 与 GyroZ 【反号】——
