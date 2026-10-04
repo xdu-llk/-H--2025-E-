@@ -69,7 +69,12 @@
 #define GIM_STEP_IDLE       0u
 #define GIM_STEP_CLEAR      1u      /* 该发"清错误" */
 #define GIM_STEP_ENABLE     2u      /* 该发"使能" */
-#define GIM_STEP_ZERO       3u      /* 该发"设零点" —— 上电人工摆正后定基准 */
+#define GIM_STEP_HOME       3u      /* 该发"回零": 0x05 -> 0° (上位机标定的零点) */
+#define GIM_STEP_HOME_WAIT  4u      /* 回零后等位置环走完, 期间不占用发送 */
+
+/* 回零保持时间: 最大可能要转半圈 (180°), 按 ~560°/s 估算约 0.35 s, 留 500 ms。
+ * 这段时间不发 0x04, 否则第一条速度指令会把回零的位置环半路切走。 */
+#define GIM_HOME_SETTLE_MS  500u
 
 /* 视觉掉线判定。MaixCam 约 55 fps (18 ms 一帧), 100 ms ≈ 连丢 5~6 帧。
  * ⚠️ 必须有这一条: 没有它的话 vision_link_get() 一直返回 false 时, err_valid
@@ -332,6 +337,7 @@ int main(void)
     uint16_t sync_cnt     = 0;    /* 定位发了多少拍, 超时兜底用 */
     bool     need_send = false; /* 本拍收到了新视觉帧 -> 立刻发, 不等定时 */
     uint8_t  gim_step  = GIM_STEP_IDLE;  /* 云台初始化序列的推进状态 */
+    uint16_t home_wait_ms = 0;           /* 回零后的落位等待时间 (ms) */
 
     SYSCFG_DL_init();
 #if DEBUG_PRINT_ENABLE
@@ -343,7 +349,7 @@ int main(void)
 
     laser_set(true);        /* 当前策略: 常亮 */
 
-    /* 开机触发一次"清错误 -> 使能"序列。真正的发送由主循环逐步推进,
+    /* 开机触发一次"清错误 -> 使能 -> 回零"序列。真正的发送由主循环逐步推进,
      * 原因见下面 gim_step 的说明。 */
     gim_step = GIM_STEP_CLEAR;
 
@@ -454,12 +460,22 @@ int main(void)
             }
         } else if (gim_step == GIM_STEP_ENABLE) {
             if (gimbal_enable()) {
-                gim_step = GIM_STEP_ZERO;
+                gim_step = GIM_STEP_HOME;
             }
-        } else if (gim_step == GIM_STEP_ZERO) {
-            /* ⚠️ 上电时人已把云台摆到车头方向 —— 把这那一刻设成 0°。
-             * 之后所有 0x05 绝对角都以它为准, 不设的话基准是随机的。 */
-            if (gimbal_set_zero()) {
+        } else if (gim_step == GIM_STEP_HOME) {
+            /* 回零: 零点由上位机标定、存在电机里, 这里只发 0x05 转到 0°。
+             * ⚠️ 绝不能发 0xFE(重设零点) —— 会把上位机标定的零点覆盖掉。 */
+            if (gimbal_set_angle(0.0f)) {
+                gim_step      = GIM_STEP_HOME_WAIT;
+                home_wait_ms  = 0u;
+            }
+        } else if (gim_step == GIM_STEP_HOME_WAIT) {
+            /* 等位置环把回零动作走完再放行瞄准逻辑, 否则第一条 0x04
+             * 会把位置环半路切走, 云台停在回零途中的位置。 */
+            if (home_wait_ms < 0xFFFFu) {
+                home_wait_ms++;
+            }
+            if (home_wait_ms >= GIM_HOME_SETTLE_MS) {
                 gim_step = GIM_STEP_IDLE;
             }
         }

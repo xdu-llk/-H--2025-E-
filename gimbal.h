@@ -125,11 +125,15 @@ bool gimbal_set_speed(float rpm);
 
 /* 绝对角度 (0x05)。rad 内部归一到 [0, 2π), 编码 θ/(2π) × 65535。
  * ⚠️ 满量程和 0x07 的 32767 【不同】—— 手册 5.3.2.1 明确写的是 uint16/65535。
- * ⚠️ 是电机【自己零点】的绝对角, 不是世界系。零点由 0xFE 设。 */
+ * ⚠️ 是电机【自己零点】的绝对角, 不是世界系。
+ *    本工程零点由**上位机标定**并存在电机里: 上电后发 0x05 转到 0° 回零;
+ *    ⚠️ 不要发 0xFE(重设零点) —— 会把上位机标定覆盖成当前位置。 */
 bool gimbal_set_angle(float rad);
 
 bool gimbal_enable(void);
 bool gimbal_disable(void);
+/* ⚠️ 重设零点(0xFE): 把当前姿态写成新的 0°, 覆盖上位机标定。
+ * 本工程不用它 —— 上电回零请用 gimbal_set_angle(0.0f)。 */
 bool gimbal_set_zero(void);
 bool gimbal_clear_error(void);
 

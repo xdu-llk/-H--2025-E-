@@ -215,6 +215,7 @@ bool gimbal_disable(void)
     return gimbal_send_cmd(GIMBAL_CMD_DISABLE, 0);
 }
 
+/* ⚠️ 重设零点(0xFE): 覆盖上位机标定的零点。本工程不用, 上电回零走 0x05。 */
 bool gimbal_set_zero(void)//设置零点
 {
     return gimbal_send_cmd(GIMBAL_CMD_SET_ZERO, 0);
