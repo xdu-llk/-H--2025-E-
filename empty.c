@@ -174,7 +174,7 @@
 #define GYRO_RATE_AXIS      2u
 
 /* 一阶低通, 每陀螺帧一次 (100 Hz)。1.0 = 关闭 */
-#define GYRO_LPF_ALPHA      1.0f
+#define GYRO_LPF_ALPHA      0.4f
 
 /* 陀螺原始角速度 (GyroZ) 与【车体偏航角 psi】的符号关系。
  * psi 是从模块 Yaw 差分累加的 (顺时针为正), 而模块的 Yaw 与 GyroZ 【反号】——
@@ -549,7 +549,9 @@ int main(void)
                 if (curve_cnt >= CURVE_DEBOUNCE) {
                     curve_cnt = 0;
                     if (in_curve) {
-                        in_curve = false;       /* 出弯: 下一拍起云台停住 */
+                        in_curve   = false;     /* 出弯 */
+                        curve_sync = false;     /* 清掉定位残留, 免得下次进弯定位变短 */
+                        sync_cnt   = 0;
                     } else {
                         in_curve  = true;       /* 进弯 */
                         curve_new = true;
@@ -559,12 +561,7 @@ int main(void)
                     curve_sync = true;
                 }
 
-                if (!in_curve) {
-                    /* --- 直道: 不瞄, 云台停在原地 --- */
-                    if (!aim_send(0.0f, false, 0.0f)) {
-                        gimbal_send_cmd(GIMBAL_CMD_SPEED, 0);
-                    }
-                } else if (curve_sync) {
+                if (in_curve && curve_sync) {
                     /* --- 进弯: 0x05 拉到几何绝对角, 保持满 SYNC_MAX_TICKS 再交棒。
                      * 不能"发一次就走"(下一拍 0x04 会覆盖位置环, 云台基本没转),
                      * 也不要拿视觉误差提前切 —— 打断位置环反而落不稳。 --- */
@@ -575,7 +572,9 @@ int main(void)
                         }
                     }
                 } else {
-                    /* --- 弯道中: 几何前馈 + 视觉 P --- */
+                    /* --- 一直瞄: 几何前馈 + 视觉 P (直道/弯道不分) ---
+                     * 直道上 psi_dot≈0 -> 前馈≈0, 实际是视觉在拉;
+                     * 弯道上加上几何前馈。靶不在视野时 err_valid=false, 只剩前馈。 */
                     float w_ff = 0.0f;
 #if (AIM_STAGE == 1) || (AIM_STAGE == 3)
                     w_ff = guidance_ff(psi_rad, psi_dot);
