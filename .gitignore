@@ -1,0 +1,30 @@
+# ============ Python ============
+__pycache__/
+*.pyc
+
+# ============ CCS 编译产物（自动生成，不入库）============
+# 只要 .syscfg 和 .cproject 还在，构建一次全都回来。
+#   Debug/ 里：
+#     *.o *.d                编译中间件
+#     *.map *.out *.xml      链接产物（.out 是烧录固件，但全靠源码生成）
+#     makefile *.mk *.opt    由 .cproject 生成
+#     ti_msp_dl_config.c/.h  SysConfig 从 .syscfg 生成
+**/Debug/
+**/Release/
+
+# CCS 给 clangd 生成的符号库，文件头自带 do-not-add-to-source-control
+**/.clangd
+
+# ============ MaixCam 打包产物 ============
+# maixcam 打出来的应用 zip，源码 + 模型都在，可重新打包。
+**/dist/
+
+# ============ 旧版数字模型目录 ============
+# 模型已挪到 rectangle/ 下，这份是重复的副本（约 15MB）
+model-digit.maixcam2/
+
+# ============ AI 工具目录 / 本机配置（非项目源码）============
+.claude/
+.codex/
+.theia/
+.mcp.json
