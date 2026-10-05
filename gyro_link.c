@@ -243,7 +243,7 @@ static void gyro_link_send_init(void)
     const uint8_t mode_full = 0x00u;    /* 0 = 全数据模式 (含原始陀螺) */
     const uint8_t rep_on    = 0x01u;    /* 1 = 启动上报 */
 
-    /* 必须先切全数据模式: 速率环要的是 GyroZ 原始角速度, 仅姿态模式给不了 */
+    /* 必须先切全数据模式: 前馈要的是 GyroZ 原始角速度, 仅姿态模式给不了 */
     gyro_link_send_cmd(GYRO_CMD_SET_MODE, &mode_full, 1u);
     gyro_link_send_cmd(GYRO_CMD_REPORT_CTRL, &rep_on, 1u);
 }

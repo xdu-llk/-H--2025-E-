@@ -52,5 +52,6 @@ C:\Users\jeveux\.claude\projects\<新工作区路径编码>\memory\
 | `verify-before-generalizing.md` | 习惯 | 别一次就下结论，测 3 次以上 |
 | `vision-capability.md` | 工具 | 可以直接读图 |
 
-**更详细的接口说明看** [`../引脚分配与接口.md`](../引脚分配与接口.md)。
+**更详细的接口说明看** [`../硬件与接口.md`](../硬件与接口.md)。
+**架构/参数/待办看** [`../PROJECT.md`](../PROJECT.md)。
 **已知问题看** [`../BUGS.md`](../BUGS.md)。

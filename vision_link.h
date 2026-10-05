@@ -10,8 +10,8 @@
  *       ERR_X    : int16 **小端、有符号**
  *       CHECKSUM : 前 5 字节之和 & 0xFF
  *
- * MaixCam 侧对应 camera_display.py 的 build_uart_frame()，
- * 用 pack("<Bh", status, err_x) 打包。
+ * MaixCam 侧对应 no_canny.py 的 build_uart_frame()，
+ * 用 pack("<Bh", status, err_x) 打包。(camera_display.py 已弃用)
  */
 
 #ifndef VISION_LINK_H_
