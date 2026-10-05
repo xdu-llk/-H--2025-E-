@@ -33,7 +33,7 @@
 #include <stdio.h>
 
 /* 打开后每秒多打一行 UART1 收到的原始字节 (十六进制)。
- * 用于排查"云台反馈收不到"—— 详见 docs/BUGS.md #1。
+ * 用于排查"云台反馈收不到"—— 详见 docs/给AI看的.md 第 7 节 #1。
  */
 #define DEBUG_GIMBAL_SNOOP      0
 
@@ -589,8 +589,9 @@ int main(void)
         }
 
 #if DEBUG_PRINT_ENABLE
-        /* 上板 bring-up 用的状态行。⚠️ 会阻塞约 3.5 ms, 正式跑之前把
-         * debug_uart.h 里的 DEBUG_PRINT_ENABLE 改成 0 (详见该文件说明)。
+        /* 上板 bring-up 用的状态行。⚠️ 非阻塞(只塞 256 字节环形缓冲, 微秒级;
+         * 发送交给 UART0 TX 中断, 缓冲满则丢字), 实测约 9 ms/秒 = 0.8% CPU。
+         * 所以跑车时【不必】关掉 DEBUG_PRINT_ENABLE (详见 debug_uart.h)。
          *
          *   V  视觉帧数    —— 不涨 = MaixCam 没发 / UART3 接线错
          *      vc/vo 校验错/溢出次数, vg 本周期最大帧间隔 (ms, 抓帧率抖动)
@@ -635,7 +636,7 @@ int main(void)
 #if DEBUG_GIMBAL_SNOOP
             /* UART1 最近收到的原始字节 (最旧 -> 最新)。看电机到底发的是什么:
              * 如果线上真是一帧一帧的, 这行里能直接看出帧结构 (ID/状态/角度/CRC)。
-             * 排查"云台反馈收不到"时把它打开 —— 见 docs/BUGS.md #1。 */
+             * 排查"云台反馈收不到"时把它打开 —— 见 docs/给AI看的.md 第 7 节 #1。 */
             printf("  RX1:");
             for (di = 0u; di < GIMBAL_SNOOP_LEN; di++) {
                 uint8_t idx = (uint8_t) ((g_gimbal_snoop_pos + di) %
