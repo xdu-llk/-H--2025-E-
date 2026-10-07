@@ -44,7 +44,8 @@
  *     读这段时间 GyroZ 原始值的平均值, 标度 = 平均值 / 45。
  *     过程中要匀速, 且首尾各丢掉一小段 (加减速阶段)。
  */
-#define GYRO_LSB_PER_DPS    16.4f
+/* 临时比例对比测试值, 尚未标定; 上一版为 16.4f。 */
+#define GYRO_LSB_PER_DPS    32.8f
 
 typedef struct {
     int16_t acc_raw[3];     /* [0]=X [1]=Y [2]=Z */
