@@ -126,11 +126,6 @@
  *   3 = 全部 */
 #define AIM_STAGE               3
 
-/* 临时几何速度前馈测试: 1=仅清错误+使能后发送 guidance_ff(),
- * 不发任何角度指令, 不判断进出弯, 不叠加视觉纠偏。
- * 改回 0 并重新构建即可恢复原控制流程。 */
-#define GEO_FF_ONLY_TEST        1
-
 /* --- 进/出弯检测 ---
  * psi 分不清"左弯末尾"和"右弯开头"(都是 180°), 只能用 psi_dot:
  *   弯道 |psi_dot| ≈ v/R ≈ 1 rad/s     直道 ≈ 0 (只有循迹修正)
@@ -335,17 +330,13 @@ int main(void)
     float    psi_rad      = 0.0f; /* 车体偏航角 (rad), 回绕差分累加 */
     float    psi_prev     = 0.0f; /* 上一帧原始 Yaw (deg), 算回绕用 */
     bool     psi_inited   = false;/* 首帧只记基准, 不累加 */
-#if !GEO_FF_ONLY_TEST
     bool     in_curve     = false;/* 当前在弯道上? 直道/弯道都要瞄(直道上前馈为0) */
     uint16_t curve_cnt    = 0;    /* |psi_dot| 连续超阈值的拍数, 去抖用 */
     bool     curve_sync   = false;/* 进弯后还在用 0x05 定位中 */
     uint16_t sync_cnt     = 0;    /* 定位发了多少拍, 超时兜底用 */
-#endif
     bool     need_send = false; /* 本拍收到了新视觉帧 -> 立刻发, 不等定时 */
     uint8_t  gim_step  = GIM_STEP_IDLE;  /* 云台初始化序列的推进状态 */
-#if !GEO_FF_ONLY_TEST
     uint16_t home_wait_ms = 0;           /* 回零后的落位等待时间 (ms) */
-#endif
 
     SYSCFG_DL_init();
 #if DEBUG_PRINT_ENABLE
@@ -468,13 +459,8 @@ int main(void)
             }
         } else if (gim_step == GIM_STEP_ENABLE) {
             if (gimbal_enable()) {
-#if GEO_FF_ONLY_TEST
-                gim_step = GIM_STEP_IDLE;
-#else
                 gim_step = GIM_STEP_HOME;
-#endif
             }
-#if !GEO_FF_ONLY_TEST
         } else if (gim_step == GIM_STEP_HOME) {
             /* 回零: 零点由上位机标定、存在电机里, 这里只发 0x05 转到 0°。
              * ⚠️ 绝不能发 0xFE(重设零点) —— 会把上位机标定的零点覆盖掉。 */
@@ -491,7 +477,6 @@ int main(void)
             if (home_wait_ms >= GIM_HOME_SETTLE_MS) {
                 gim_step = GIM_STEP_IDLE;
             }
-#endif
         }
 
         /* --- 云台反馈 --- */
@@ -545,19 +530,17 @@ int main(void)
                 bool  rate_ok = (gyro_lost < GYRO_LOST_TICKS);
                 float psi_dot = rate_ok ? PSI_RATE() : 0.0f;
 
-#if GEO_FF_ONLY_TEST
-                float w_ff = guidance_ff(psi_rad, psi_dot);
-                if (!aim_send(w_ff, false, 0.0f)) {
-                    gimbal_send_cmd(GIMBAL_CMD_SPEED, 0);
-                }
-#else
                 /* --- 进/出弯检测 ---
                  * psi 分不清"左弯末尾"和"右弯开头"(都是 180°), 只能用 psi_dot:
                  *   弯道 |psi_dot| ≈ v/R ≈ 1 rad/s     直道 ≈ 0
-                 * 迟滞 (进弯用高阈值/出弯用低阈值) + 连续 N 拍去抖。 */
+                 * 迟滞: 直道时持续高于进弯阈值才进弯,
+                 *       弯道时持续低于出弯阈值才出弯; 连续 N 拍去抖。 */
                 float thr = in_curve ? CURVE_OFF_RADS : CURVE_ON_RADS;
+                bool curve_transition = in_curve
+                    ? (fabsf(psi_dot) < thr)
+                    : (fabsf(psi_dot) > thr);
 
-                if (fabsf(psi_dot) > thr) {
+                if (curve_transition) {
                     if (curve_cnt < 0xFFFFu) {
                         curve_cnt++;
                     }
@@ -605,7 +588,6 @@ int main(void)
                         gimbal_send_cmd(GIMBAL_CMD_SPEED, 0);
                     }
                 }
-#endif /* GEO_FF_ONLY_TEST */
 #endif
             }
         }
